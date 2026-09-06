@@ -4547,6 +4547,17 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 /// would wedge those PVCs Pending forever instead of letting the ordinary
 /// PV-matching bind proceed.
 ///
+/// Unlike `selected_node_patches` (which only stamps `selected-node` on a
+/// `WaitForFirstConsumer` StorageClass — an `Immediate` one already has its
+/// own provisioning path), this does NOT check `volumeBindingMode`, and that
+/// is deliberate rather than an oversight: an `Immediate` PVC normally
+/// finishes binding before its pod is scheduled at all (so it never reaches
+/// here unbound), but if it races ahead, gating it exactly like a WFFC PVC
+/// only NARROWS the candidate set to nodes that can actually register the
+/// eventual driver — it can never wrongly reject the node the volume ends up
+/// on, since that volume needs the same CSINode-registered driver to mount
+/// regardless of which binding mode provisioned it.
+///
 /// A GET failure is propagated, not swallowed, for the same reason
 /// `fetch_bound_pv_node_affinities` propagates its own: silently treating
 /// it as "no driver" here would let the scheduler bind the pod onto a node
