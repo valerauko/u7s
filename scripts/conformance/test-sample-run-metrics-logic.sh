@@ -9,9 +9,8 @@
 #
 # Covers the three failure modes the bead exists to prevent:
 #
-#   1. start/reap happy path — a real listener stands in for the apiserver
-#      (same technique as test-port-kill-logic.sh) so resolve_apiserver_pid's
-#      real lsof-based lookup is exercised, not mocked.
+#   1. start/reap happy path — a real listener stands in for the apiserver so
+#      resolve_apiserver_pid's real lsof-based lookup is exercised, not mocked.
 #   2. missing-process robustness — the sampler must survive an interval with
 #      NO apiserver, NO scheduler, NO konnectivity-server, NO VM, and a dead
 #      /metrics endpoint without the background loop dying, AND `stop` must be
