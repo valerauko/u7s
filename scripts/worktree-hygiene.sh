@@ -33,7 +33,10 @@
 #   destroying review state) are never touched.
 # STEP D: delete non-worker branches whose tracked upstream is gone, via
 #   `-d` (refuses anything unmerged -- an extra safety net on top of D's
-#   own scope, which never matches branches with no upstream at all).
+#   own scope, which never matches branches with no upstream at all), guarded
+#   by the same in-flight check STEP C uses so a branch still checked out in
+#   a live worktree is skipped rather than erroring the whole run when git
+#   refuses to delete it.
 # STEP E: warn (never delete) about tracked ai/findings/*.md files whose
 #   `Bead:` header is closed or absent from LIVE bd state -- the drift
 #   backstop for check-findings-closed-bead-refs.sh's CI-side check, which
@@ -282,10 +285,19 @@ gone_upstream_branches() {
 }
 
 step_d_gone_upstream_branches() {
-  local refs branch
+  local refs branch checked_out
   refs=$(git -C "$REPO_ROOT" for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads/)
+  checked_out=$(checked_out_branches "$(git -C "$REPO_ROOT" worktree list --porcelain)")
   while IFS= read -r branch; do
     [ -n "$branch" ] || continue
+    # A merged worker branch's upstream goes [gone] the instant the merge
+    # queue deletes its remote head, which can race ahead of the tick that
+    # reaps its worktree. `git branch -d` refuses to delete a branch checked
+    # out in ANY live worktree regardless of merge state, and that refusal
+    # would otherwise abort this whole run via `set -e` (see file header) --
+    # leave it for the tick's reap (or the next hygiene run once the
+    # worktree is gone) instead of erroring on a benign, self-resolving race.
+    is_checked_out "$branch" "$checked_out" && continue
     run_cmd git -C "$REPO_ROOT" branch -d "$branch"
   done < <(gone_upstream_branches "$refs")
 }
