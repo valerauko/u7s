@@ -1032,9 +1032,9 @@ pub struct NodeItem {
     /// Remaining CSI attach capacity per driver — `CSINode.spec.drivers[].allocatable.count`
     /// minus how many volumes of that driver are already attached to this node, for every
     /// driver the node advertises a limit for. Never present in the raw `/api/v1/nodes` JSON
-    /// (hence `skip_deserializing`) — `pick_node` fills this in from a separate CSINode GET
-    /// plus a cluster-wide pod scan, only when the pending pod itself needs CSI volumes, right
-    /// before calling `select_and_reserve_node`. A driver absent here has no advertised limit
+    /// (hence `skip_deserializing`) — `select_and_reserve_node` fills this in from
+    /// `NodeTally`'s watch-maintained CSI caches, under its own tally lock, only when the
+    /// pending pod itself needs CSI volumes. A driver absent here has no advertised limit
     /// (or the pod needs none of it) — see `csi_volume_limits_fit`.
     #[serde(default, skip_deserializing)]
     pub csi_driver_headroom: std::collections::BTreeMap<String, i64>,
@@ -4546,6 +4546,17 @@ const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
 /// CSINode entry, will ever exist for it, so gating on CSINode presence
 /// would wedge those PVCs Pending forever instead of letting the ordinary
 /// PV-matching bind proceed.
+///
+/// Unlike `selected_node_patches` (which only stamps `selected-node` on a
+/// `WaitForFirstConsumer` StorageClass — an `Immediate` one already has its
+/// own provisioning path), this does NOT check `volumeBindingMode`, and that
+/// is deliberate rather than an oversight: an `Immediate` PVC normally
+/// finishes binding before its pod is scheduled at all (so it never reaches
+/// here unbound), but if it races ahead, gating it exactly like a WFFC PVC
+/// only NARROWS the candidate set to nodes that can actually register the
+/// eventual driver — it can never wrongly reject the node the volume ends up
+/// on, since that volume needs the same CSINode-registered driver to mount
+/// regardless of which binding mode provisioned it.
 ///
 /// A GET failure is propagated, not swallowed, for the same reason
 /// `fetch_bound_pv_node_affinities` propagates its own: silently treating

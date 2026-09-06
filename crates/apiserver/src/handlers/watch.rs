@@ -310,8 +310,18 @@ struct PartialObjectMetadataEnvelopeOwned {
 /// Move `obj`'s metadata into a PartialObjectMetadata envelope and drop the rest of `obj` (spec,
 /// status, everything else) immediately, so a watch event never holds the full object and its
 /// metadata-only projection in memory at once.
+///
+/// Uses `get_mut`/`take` rather than `obj["metadata"].take()` (serde_json `IndexMut`): indexing
+/// with `[]` panics whenever `obj` itself isn't a JSON object (e.g. a corrupt store entry whose
+/// raw bytes are a bare scalar, reachable via `prepare_live_event` with both selectors empty),
+/// whereas `get_mut` returns `None` for exactly that case — matching the graceful fallback the
+/// borrowed `to_partial_object_metadata` already has via `obj.get("metadata")`.
 fn take_partial_object_metadata(mut obj: serde_json::Value) -> PartialObjectMetadataEnvelopeOwned {
-    let metadata = obj["metadata"].take();
+    let metadata = obj
+        .get_mut("metadata")
+        .filter(|m| m.is_object())
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null);
     drop(obj);
     PartialObjectMetadataEnvelopeOwned {
         api_version: "meta.k8s.io/v1",
@@ -558,16 +568,27 @@ fn parse_set_values(s: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Shared label-selector decision logic, parameterized over how to look up a label's value so
-/// `object_matches_label_selector` (full `Value`) and `SelectorProjection::matches` (the
-/// cheap pre-parse projection below) evaluate the exact same operators against the exact same
-/// data — a hand-duplicated second copy of this logic is exactly the kind of drift that would
-/// make a selector'd watch's projection-based pre-filter and its full-object filter disagree.
+/// Shared label-selector decision logic, parameterized over how to look up a label's presence
+/// and value so `object_matches_label_selector` (full `Value`) and `SelectorProjection::matches`
+/// (the cheap pre-parse projection below) evaluate the exact same operators against the exact
+/// same data — a hand-duplicated second copy of this logic is exactly the kind of drift that
+/// would make a selector'd watch's projection-based pre-filter and its full-object filter
+/// disagree.
+///
+/// `has_key` and `label` are separate (rather than deriving presence from `label(key).is_some()`)
+/// because Exists/DoesNotExist must key off whether the label is present at all, not whether its
+/// value happens to be a string: a stored `metadata.labels` value that isn't a JSON string (e.g.
+/// `null`) still counts as present for `!key`/bare `key`, even though `label(key)` returns `None`
+/// for it the same as a genuinely absent key.
 ///
 /// Supported operators: `key=value` (Equality), `key!=value` (NotEquals),
 /// `!key` (DoesNotExist), bare `key` (Exists),
 /// `key in (v1,v2)` (In), `key notin (v1,v2)` (NotIn).
-fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a str>) -> bool {
+fn label_selector_matches<'a>(
+    selector: &str,
+    has_key: impl Fn(&str) -> bool,
+    label: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
     if selector.is_empty() {
         return true;
     }
@@ -580,7 +601,7 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
             if key.is_empty() {
                 continue;
             }
-            if label(key).is_some() {
+            if has_key(key) {
                 return false;
             }
             continue;
@@ -633,7 +654,7 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
         if key.is_empty() {
             continue;
         }
-        if label(key).is_none() {
+        if !has_key(key) {
             return false;
         }
     }
@@ -645,7 +666,11 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
 /// `metadata.labels` in the object. Used to filter live watch events.
 pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
     let labels = &obj["metadata"]["labels"];
-    label_selector_matches(selector, |key| labels.get(key).and_then(|v| v.as_str()))
+    label_selector_matches(
+        selector,
+        |key| labels.get(key).is_some(),
+        |key| labels.get(key).and_then(|v| v.as_str()),
+    )
 }
 
 /// Shared field-selector decision logic, parameterized over the three fields it ever reads —
@@ -744,13 +769,16 @@ struct SelectorProjectionSpec<'a> {
 
 impl SelectorProjection<'_> {
     fn matches(&self, label_selector: &str, field_selector: &str) -> bool {
-        label_selector_matches(label_selector, |key| self.metadata.labels.get(key).copied())
-            && field_selector_matches_parts(
-                field_selector,
-                self.metadata.name,
-                self.metadata.namespace,
-                self.spec.node_name,
-            )
+        label_selector_matches(
+            label_selector,
+            |key| self.metadata.labels.contains_key(key),
+            |key| self.metadata.labels.get(key).copied(),
+        ) && field_selector_matches_parts(
+            field_selector,
+            self.metadata.name,
+            self.metadata.namespace,
+            self.spec.node_name,
+        )
     }
 }
 
@@ -1379,8 +1407,15 @@ async fn watch_generic_impl<S: Store>(
                                         // present, so a later MODIFIED that leaves the watch scope is
                                         // known to be a real transition-out, not a phantom delete for
                                         // an object the watcher was never told about (see
-                                        // should_emit_synthetic_delete).
-                                        ever_matched.insert((obj_ns.to_string(), obj_name.to_string()));
+                                        // should_emit_synthetic_delete). Only reachable here (past the
+                                        // no-selector fast path above) for a CR watch with both
+                                        // selectors empty, which is exactly the case
+                                        // watch_tracks_ever_matched gates: now_matches short-circuits
+                                        // true forever for such a watch, so the else-branch remove
+                                        // below can never read this entry back.
+                                        if watch_tracks_ever_matched(&label_selector, &field_selector) {
+                                            ever_matched.insert((obj_ns.to_string(), obj_name.to_string()));
+                                        }
                                         tracing::debug!(
                                             prefix = %prefix,
                                             event_type,
@@ -2095,6 +2130,40 @@ mod tests {
         );
     }
 
+    /// `take_partial_object_metadata` used to use `obj["metadata"].take()` (serde_json
+    /// `IndexMut`), which panics whenever `obj` itself is not a JSON object — e.g. a corrupt
+    /// store entry whose raw bytes are a bare scalar, reachable through `prepare_live_event`
+    /// with both selectors empty (an empty selector always "matches", so a non-object parse
+    /// isn't filtered out upstream the way a real object failing the selector would be). A
+    /// panic here would take down the whole watch stream, not just skip the one corrupt object.
+    #[test]
+    fn prepare_live_event_does_not_panic_on_non_object_store_entry_as_partial_object_metadata() {
+        let got = prepare_live_event(
+            b"5",
+            "MODIFIED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            true,
+            "",
+            "",
+        )
+        .expect(
+            "a non-object but validly-parsed store entry still passes an empty selector and \
+             must still produce an event, not None",
+        );
+
+        let expected = "{\"type\":\"MODIFIED\",\"object\":{\"apiVersion\":\"meta.k8s.io/v1\",\"kind\":\"PartialObjectMetadata\",\"metadata\":null}}\n";
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "a non-object stored entry must fall back to metadata: null, matching \
+             to_partial_object_metadata's graceful handling of the same input, instead of \
+             panicking and killing the whole watch stream"
+        );
+    }
+
     /// Regression guard: if encode_watch_event ever strips metadata.resourceVersion
     /// (e.g. by rebuilding the object from scratch), this test must fail.
     #[test]
@@ -2217,6 +2286,44 @@ mod tests {
             "prepare_fast_live_event must skip (return None) for invalid UTF-8 rather than \
              embedding raw garbage bytes into the NDJSON stream, which would break every client \
              parsing the watch response"
+        );
+    }
+
+    /// Reachability pin for the zero-parse fast path: the test above (and
+    /// `watch_generic_no_selector_fast_path_emits_byte_correct_added_event`) build their fixture
+    /// with already-alphabetical key order, so `serde_json`'s BTreeMap-backed `Value::Object`
+    /// reserializes it identically whether or not it was ever parsed — a silent revert that
+    /// routes every event back through the slow `prepare_live_event` parse+reserialize path
+    /// would NOT fail either test. This fixture instead uses deliberately non-alphabetical key
+    /// order at both the top level (`kind` before `apiVersion`) and inside `metadata`
+    /// (`resourceVersion` before `namespace`/`name`): the raw fast path echoes the stored bytes
+    /// verbatim, preserving that order, while the slow path always emits keys alphabetically.
+    /// Asserting the original (unsorted) order is therefore an observable side effect that only
+    /// the raw path produces, proving it was actually taken rather than just happening to agree.
+    #[test]
+    fn prepare_fast_live_event_reachability_preserves_non_alphabetical_key_order() {
+        let obj_json = r#"{"kind":"ConfigMap","apiVersion":"v1","metadata":{"resourceVersion":"42","namespace":"default","name":"cm"}}"#;
+        let expected = format!("{{\"type\":\"MODIFIED\",\"object\":{obj_json}}}\n");
+
+        let got = prepare_fast_live_event(
+            obj_json.as_bytes(),
+            "MODIFIED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+        )
+        .expect("valid UTF-8 JSON with already-canonical type meta must produce a chunk");
+
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "prepare_fast_live_event must preserve the stored bytes' original key order \
+             verbatim; a full parse into serde_json::Value re-sorts keys alphabetically via its \
+             BTreeMap-backed Map, so if this fails because keys got reordered, the zero-parse \
+             fast path was silently bypassed in favor of the slow parse+reserialize path — \
+             exactly the routing regression this test exists to catch"
         );
     }
 
@@ -4077,6 +4184,29 @@ mod tests {
         assert!(
             !object_matches_label_selector(&no_labels, "app"),
             "object with no labels must NOT match Exists selector"
+        );
+    }
+
+    /// Exists/DoesNotExist must key off whether the label is present at all, not whether its
+    /// value happens to be a JSON string. Consolidating the per-function matchers into the
+    /// shared `label_selector_matches` narrowed this to string-presence (via
+    /// `.and_then(|v| v.as_str())`), diverging from the pre-refactor code's Value-presence
+    /// check (`labels.get(key).is_some()`); a present-but-non-string label value (e.g. `null`)
+    /// would then wrongly fail Exists and wrongly pass DoesNotExist.
+    #[test]
+    fn label_selector_exists_and_does_not_exist_use_value_presence_not_string_presence() {
+        let non_string_value = serde_json::json!({"metadata": {"labels": {"app": null}}});
+
+        assert!(
+            object_matches_label_selector(&non_string_value, "app"),
+            "a present-but-non-string label value must still satisfy Exists(key) — narrowing \
+             to string-presence would wrongly drop this object from the watch"
+        );
+        assert!(
+            !object_matches_label_selector(&non_string_value, "!app"),
+            "a present-but-non-string label value must still count as 'exists' for \
+             DoesNotExist(!key), i.e. the selector must NOT match — narrowing to \
+             string-presence would wrongly deliver this object to a watcher filtering it out"
         );
     }
 
