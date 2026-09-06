@@ -474,10 +474,10 @@ const NODE_WATCH_PATH: &str =
 /// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
 /// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
 /// scheduling directly — they only keep `NodeTally`'s CSI-driver-resolution
-/// caches current, so `populate_csi_driver_headroom` can resolve a PVC's
-/// backing driver synchronously (zero I/O) at scheduling-decision time
-/// instead of a live GET chain per decision (see that function's doc
-/// comment for why the live-GET version raced under concurrent scheduling).
+/// caches current, so `select_and_reserve_node` can resolve a PVC's backing
+/// driver synchronously (zero I/O) at scheduling-decision time instead of a
+/// live GET chain per decision (see that function's doc comment for why the
+/// live-GET version raced under concurrent scheduling).
 ///
 /// `clear` runs before every (re)connect, including the first, for the same
 /// reason `NodeTally::clear` runs on the pod watch's own reconnect: a delete

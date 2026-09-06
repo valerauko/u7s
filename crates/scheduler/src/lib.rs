@@ -1032,9 +1032,9 @@ pub struct NodeItem {
     /// Remaining CSI attach capacity per driver — `CSINode.spec.drivers[].allocatable.count`
     /// minus how many volumes of that driver are already attached to this node, for every
     /// driver the node advertises a limit for. Never present in the raw `/api/v1/nodes` JSON
-    /// (hence `skip_deserializing`) — `pick_node` fills this in from a separate CSINode GET
-    /// plus a cluster-wide pod scan, only when the pending pod itself needs CSI volumes, right
-    /// before calling `select_and_reserve_node`. A driver absent here has no advertised limit
+    /// (hence `skip_deserializing`) — `select_and_reserve_node` fills this in from
+    /// `NodeTally`'s watch-maintained CSI caches, under its own tally lock, only when the
+    /// pending pod itself needs CSI volumes. A driver absent here has no advertised limit
     /// (or the pod needs none of it) — see `csi_volume_limits_fit`.
     #[serde(default, skip_deserializing)]
     pub csi_driver_headroom: std::collections::BTreeMap<String, i64>,
