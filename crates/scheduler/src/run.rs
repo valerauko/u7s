@@ -474,10 +474,10 @@ const NODE_WATCH_PATH: &str =
 /// Run one of the scheduler's secondary cache-maintenance watches (PVC/PV/
 /// StorageClass/CSINode). Unlike the primary pod watch, these never trigger
 /// scheduling directly — they only keep `NodeTally`'s CSI-driver-resolution
-/// caches current, so `populate_csi_driver_headroom` can resolve a PVC's
-/// backing driver synchronously (zero I/O) at scheduling-decision time
-/// instead of a live GET chain per decision (see that function's doc
-/// comment for why the live-GET version raced under concurrent scheduling).
+/// caches current, so `select_and_reserve_node` can resolve a PVC's backing
+/// driver synchronously (zero I/O) at scheduling-decision time instead of a
+/// live GET chain per decision (see that function's doc comment for why the
+/// live-GET version raced under concurrent scheduling).
 ///
 /// `clear` runs before every (re)connect, including the first, for the same
 /// reason `NodeTally::clear` runs on the pod watch's own reconnect: a delete
@@ -730,6 +730,15 @@ fn handle_pod_event(
         // pick_node's own GET /api/v1/nodes failure below: leave the pod
         // Pending for the next watch tick rather than schedule it as if the
         // bound PV had no topology constraint at all.
+        //
+        // The four `fetch_*` calls below each independently GET every one of
+        // `pending.pvc_names` (via their own `fetch_pvc_binding_info` call) —
+        // up to 4x redundant PVC GETs per scheduling attempt with no cache
+        // shared across them. Left as-is: cost is bounded by this pod's own
+        // PVC count (typically 1-3), not cluster size, and unifying four
+        // independently-typed derivations behind one shared fetch is a
+        // signature-touching refactor deferred as a follow-up, correctness
+        // being unaffected either way.
         if !pending.pvc_names.is_empty() {
             match fetch_bound_pv_node_affinities(
                 &connector_clone,
@@ -1079,6 +1088,18 @@ pub async fn run_scheduler(
     // `node_cache_synced_tx` (declared above, alongside the resync loop that
     // shares it) is notified below once, on the node watch's first
     // sendInitialEvents relist.
+    //
+    // Only the node watch gets a `ready` sender — the PVC/PV/StorageClass/
+    // CSINode caches deliberately have none. A pod needing `csi_topology_fit`
+    // (see its doc comment) scheduled before the CSINode watch's own initial
+    // relist lands sees an empty `node_registered_drivers` set and fails
+    // closed on every node, same as any other watch-cache-miss; unlike the
+    // node cache's absence (which would fail closed for EVERY pending pod),
+    // this only affects pods with unbound CSI-backed PVCs, and self-heals via
+    // `pods_needing_resync`'s `RESYNC_INTERVAL` retry (30s) once the relist
+    // lands — never a permanent wedge. Gating the pod watch on it too would
+    // trade a bounded, narrow, self-healing delay for an unconditional
+    // startup stall on every pod, CSI or not — not worth it pre-alpha.
     for (path, apply, clear, ready) in [
         (
             PVC_WATCH_PATH,
