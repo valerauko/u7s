@@ -310,8 +310,18 @@ struct PartialObjectMetadataEnvelopeOwned {
 /// Move `obj`'s metadata into a PartialObjectMetadata envelope and drop the rest of `obj` (spec,
 /// status, everything else) immediately, so a watch event never holds the full object and its
 /// metadata-only projection in memory at once.
+///
+/// Uses `get_mut`/`take` rather than `obj["metadata"].take()` (serde_json `IndexMut`): indexing
+/// with `[]` panics whenever `obj` itself isn't a JSON object (e.g. a corrupt store entry whose
+/// raw bytes are a bare scalar, reachable via `prepare_live_event` with both selectors empty),
+/// whereas `get_mut` returns `None` for exactly that case — matching the graceful fallback the
+/// borrowed `to_partial_object_metadata` already has via `obj.get("metadata")`.
 fn take_partial_object_metadata(mut obj: serde_json::Value) -> PartialObjectMetadataEnvelopeOwned {
-    let metadata = obj["metadata"].take();
+    let metadata = obj
+        .get_mut("metadata")
+        .filter(|m| m.is_object())
+        .map(serde_json::Value::take)
+        .unwrap_or(serde_json::Value::Null);
     drop(obj);
     PartialObjectMetadataEnvelopeOwned {
         api_version: "meta.k8s.io/v1",
@@ -1397,8 +1407,15 @@ async fn watch_generic_impl<S: Store>(
                                         // present, so a later MODIFIED that leaves the watch scope is
                                         // known to be a real transition-out, not a phantom delete for
                                         // an object the watcher was never told about (see
-                                        // should_emit_synthetic_delete).
-                                        ever_matched.insert((obj_ns.to_string(), obj_name.to_string()));
+                                        // should_emit_synthetic_delete). Only reachable here (past the
+                                        // no-selector fast path above) for a CR watch with both
+                                        // selectors empty, which is exactly the case
+                                        // watch_tracks_ever_matched gates: now_matches short-circuits
+                                        // true forever for such a watch, so the else-branch remove
+                                        // below can never read this entry back.
+                                        if watch_tracks_ever_matched(&label_selector, &field_selector) {
+                                            ever_matched.insert((obj_ns.to_string(), obj_name.to_string()));
+                                        }
                                         tracing::debug!(
                                             prefix = %prefix,
                                             event_type,
@@ -2110,6 +2127,40 @@ mod tests {
              byte-identical NDJSON to the borrowed path LIST/GET still use; got {:?} want {:?}",
             got,
             expected
+        );
+    }
+
+    /// `take_partial_object_metadata` used to use `obj["metadata"].take()` (serde_json
+    /// `IndexMut`), which panics whenever `obj` itself is not a JSON object — e.g. a corrupt
+    /// store entry whose raw bytes are a bare scalar, reachable through `prepare_live_event`
+    /// with both selectors empty (an empty selector always "matches", so a non-object parse
+    /// isn't filtered out upstream the way a real object failing the selector would be). A
+    /// panic here would take down the whole watch stream, not just skip the one corrupt object.
+    #[test]
+    fn prepare_live_event_does_not_panic_on_non_object_store_entry_as_partial_object_metadata() {
+        let got = prepare_live_event(
+            b"5",
+            "MODIFIED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            true,
+            "",
+            "",
+        )
+        .expect(
+            "a non-object but validly-parsed store entry still passes an empty selector and \
+             must still produce an event, not None",
+        );
+
+        let expected = "{\"type\":\"MODIFIED\",\"object\":{\"apiVersion\":\"meta.k8s.io/v1\",\"kind\":\"PartialObjectMetadata\",\"metadata\":null}}\n";
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "a non-object stored entry must fall back to metadata: null, matching \
+             to_partial_object_metadata's graceful handling of the same input, instead of \
+             panicking and killing the whole watch stream"
         );
     }
 
