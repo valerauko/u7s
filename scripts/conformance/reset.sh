@@ -34,32 +34,23 @@ set -euo pipefail
 
 WORKDIR="$PWD/temp/u7s"
 VM_NAME="${U7S_VM_NAME:-lima-node}"
-PORT="${U7S_PORT:-6443}"
 EXTRA_NODE=""
 HOST_ONLY=0
-_KONNECTIVITY_SERVER_PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --workdir) WORKDIR="$2"; shift 2 ;;
     --vm) VM_NAME="$2"; shift 2 ;;
-    --port) PORT="$2"; shift 2 ;;
     --extra-node) EXTRA_NODE="$2"; shift 2 ;;
     --host-only) HOST_ONLY=1; shift ;;
-    --konnectivity-server-port) _KONNECTIVITY_SERVER_PORT_OVERRIDE="$2"; shift 2 ;;
+    # --port and --konnectivity-server-port are accepted for compatibility
+    # with run-all.sh's unconditional pass-through, but otherwise unused:
+    # host processes are killed by cmdline pattern (binary name + --workdir
+    # path) below, never by port number, so no port math is needed here.
+    --port) shift 2 ;;
+    --konnectivity-server-port) shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
-
-# Derive the same konnectivity ports u7s-start.sh / lima-start.sh use for this
-# --port slot (server=N, agent=N-3, admin=N-2, health=N-1; default N=8135+offset*100).
-if [ -n "$_KONNECTIVITY_SERVER_PORT_OVERRIDE" ]; then
-  KONNECTIVITY_SERVER_PORT="$_KONNECTIVITY_SERVER_PORT_OVERRIDE"
-else
-  KONNECTIVITY_SERVER_PORT=$(( 8135 + (PORT - 6443) * 100 ))
-fi
-KONNECTIVITY_AGENT_PORT=$(( KONNECTIVITY_SERVER_PORT - 3 ))
-KONNECTIVITY_ADMIN_PORT=$(( KONNECTIVITY_SERVER_PORT - 2 ))
-KONNECTIVITY_HEALTH_PORT=$(( KONNECTIVITY_SERVER_PORT - 1 ))
 
 # Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
 # first --reset targets a WORKDIR that isn't there yet) so the pkill match
@@ -89,19 +80,18 @@ for name in apiserver scheduler; do
   fi
 done
 
-# Fallback: kill apiserver on this port and scheduler bound to this worktree.
-# lsof -ti can return multiple newline-separated PIDs for one port; collecting
-# them into an array and passing each as its own argv to kill is required —
-# 'kill "$API_PID"' with a multi-line string is a single argument containing
-# embedded newlines, which kill silently fails to parse as a PID (confirmed
-# live), leaving every PID but the first one running despite the log claiming
-# success.
-# shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
-API_PIDS=($(lsof -ti tcp:"$PORT" 2>/dev/null || true))
-if [ "${#API_PIDS[@]}" -gt 0 ]; then
-  echo "[reset]   killing apiserver on port $PORT (PID(s): ${API_PIDS[*]})"
-  kill "${API_PIDS[@]}" 2>/dev/null || true
-fi
+# Fallback: kill this worktree's own u7s-apiserver / u7s-scheduler, scoped by
+# full cmdline (binary name + this workdir's path) — NOT by "whatever holds
+# the apiserver's port". A blanket 'lsof -ti tcp:$PORT | kill' also matches
+# Lima's shared 'limactl usernet' network daemon: it proxies the guest VM's
+# host.lima.internal:$PORT connections (kubelet/KCM/kube-proxy talking to the
+# apiserver) through this exact host port, so it legitimately shows up as a
+# port holder. SIGTERMing it as blanket-kill collateral breaks guest->host
+# connectivity for every OTHER worker VM sharing this Lima network, not just
+# this worktree's own VM (confirmed live: 'ip neigh' gateway goes
+# INCOMPLETE). pkill -f matches only OUR processes' argv, never the shared
+# daemon's ('limactl usernet ...' contains neither binary name nor workdir).
+pkill -f "u7s-apiserver.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
 
 # The run-metrics sampler (started by run-all.sh alongside the stack, see
@@ -115,16 +105,11 @@ bash scripts/conformance/sample-run-metrics.sh stop --workdir "$WORKDIR" >/dev/n
 # even after its origin worktree is deleted, still bound to this port slot and still
 # serving its old CA-signed cert. If left running, the next run's fresh CA/agent
 # reject that stale cert with "certificate signed by unknown authority ... ECDSA
-# verification failure" — kill whatever holds these ports before regenerating certs.
-# Same multi-PID-on-one-port hazard as the apiserver fallback above applies here.
-for kp in "$KONNECTIVITY_SERVER_PORT" "$KONNECTIVITY_AGENT_PORT" "$KONNECTIVITY_ADMIN_PORT" "$KONNECTIVITY_HEALTH_PORT"; do
-  # shellcheck disable=SC2207 # word-split intentionally: lsof -ti can return multiple PIDs, one per line.
-  KP_PIDS=($(lsof -ti tcp:"$kp" 2>/dev/null || true))
-  if [ "${#KP_PIDS[@]}" -gt 0 ]; then
-    echo "[reset]   killing konnectivity-server on port $kp (PID(s): ${KP_PIDS[*]})"
-    kill "${KP_PIDS[@]}" 2>/dev/null || true
-  fi
-done
+# verification failure" — kill it before regenerating certs. Scoped by cmdline, not
+# by port, for the same reason as the apiserver fallback above: a guest VM's
+# konnectivity-agent talking to host.lima.internal:<agent-port> makes the shared
+# Lima network daemon a legitimate holder of that port too.
+pkill -f "konnectivity-server.*${WORKDIR}" 2>/dev/null || true
 
 if [ "$HOST_ONLY" -eq 1 ]; then
   echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
