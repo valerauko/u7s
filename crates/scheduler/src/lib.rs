@@ -595,6 +595,16 @@ pub struct PendingPod {
     /// PVCs, which `read_write_once_pod_conflict` then treats as "nothing to
     /// check".
     pub read_write_once_pod_pvcs: Vec<String>,
+    /// CSI driver names this pod's OWN unbound PVCs still need
+    /// dynamically provisioned — see `fetch_unbound_csi_pvc_drivers`.
+    /// Like `pv_node_affinities`/`csi_volume_counts`/
+    /// `read_write_once_pod_pvcs`, never populated by `needs_scheduling`
+    /// itself (needs a PVC/StorageClass GET) — the caller fetches it once
+    /// via `fetch_unbound_csi_pvc_drivers` and fills it in right before the
+    /// first `pick_node` attempt. Empty for a pod with no unbound
+    /// CSI-backed PVCs, which `csi_topology_fit` then treats as "nothing to
+    /// check".
+    pub unbound_csi_pvc_drivers: Vec<String>,
 }
 
 /// Determine whether a watch event represents a pod that needs scheduling.
@@ -698,6 +708,7 @@ fn needs_scheduling_pod(pod: &Value) -> Option<PendingPod> {
         topology_spread_constraints,
         csi_volume_counts: std::collections::BTreeMap::new(),
         read_write_once_pod_pvcs: Vec::new(),
+        unbound_csi_pvc_drivers: Vec::new(),
     })
 }
 
@@ -1027,6 +1038,14 @@ pub struct NodeItem {
     /// (or the pod needs none of it) — see `csi_volume_limits_fit`.
     #[serde(default, skip_deserializing)]
     pub csi_driver_headroom: std::collections::BTreeMap<String, i64>,
+    /// CSI driver names this node's CSINode currently registers. Never
+    /// present in the raw `/api/v1/nodes` JSON (hence `skip_deserializing`)
+    /// — `select_and_reserve_node` fills this in from `NodeTally`'s
+    /// watch-maintained CSINode cache, only when the pending pod itself has
+    /// an unbound CSI-backed PVC (`PendingPod::unbound_csi_pvc_drivers`),
+    /// exactly like `csi_driver_headroom`. See `csi_topology_fit`.
+    #[serde(default, skip_deserializing)]
+    pub csi_registered_drivers: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1517,6 +1536,16 @@ pub struct NodeTally {
     /// watch-maintained by `apply_csi_node_event`, mirroring upstream's
     /// CSINode lister.
     csi_node_limits: std::collections::HashMap<String, std::collections::BTreeMap<String, i64>>,
+    /// Node name -> every CSI driver name registered in that node's CSINode
+    /// (`CSINode.spec.drivers[].name`), regardless of whether the driver
+    /// advertises an attach-count limit — watch-maintained by
+    /// `apply_csi_node_event` alongside `csi_node_limits`. A separate cache
+    /// (not derived from `csi_node_limits`'s keys) because many real CSI
+    /// drivers, csi-hostpath included, never set `allocatable.count`, so
+    /// `csi_node_limits` alone cannot answer "is this driver registered
+    /// here" — only "does it have this limit". This is `csi_topology_fit`'s
+    /// per-node input.
+    csi_node_drivers: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Node name -> node object, watch-maintained by `apply_node_event` —
     /// `pick_node`/`fetch_node`/`find_preemption_plan` read this instead of a
     /// live GET /api/v1/nodes per scheduling decision, mirroring the pod
@@ -1935,6 +1964,17 @@ impl NodeTally {
         self.csi_node_limits.clone()
     }
 
+    /// Every node's CSINode-registered CSI driver names — see
+    /// `csi_node_drivers`'s doc comment. `csi_topology_fit`'s per-node
+    /// input; read under the same lock discipline as
+    /// `csi_driver_limits_by_node` for consistency, even though a driver's
+    /// CSINode registration changes far less often than attach counts do.
+    pub fn csi_driver_names_by_node(
+        &self,
+    ) -> std::collections::HashMap<String, std::collections::HashSet<String>> {
+        self.csi_node_drivers.clone()
+    }
+
     /// Update the PVC cache from one raw PVC watch event — see `pvcs`'s doc
     /// comment. A malformed event, or one with no name, is silently ignored
     /// exactly like `apply_event`'s pod handling (a bookmark event has no
@@ -2031,16 +2071,30 @@ impl NodeTally {
         }
         if watch_event.event_type != "ADDED" && watch_event.event_type != "MODIFIED" {
             self.csi_node_limits.remove(&name);
+            self.csi_node_drivers.remove(&name);
             return;
         }
         let limits: std::collections::BTreeMap<String, i64> = watch_event
             .object
             .spec
             .drivers
-            .into_iter()
-            .filter_map(|d| d.allocatable.and_then(|a| a.count).map(|c| (d.name, c)))
+            .iter()
+            .filter_map(|d| {
+                d.allocatable
+                    .as_ref()
+                    .and_then(|a| a.count)
+                    .map(|c| (d.name.clone(), c))
+            })
             .collect();
-        self.csi_node_limits.insert(name, limits);
+        let names: std::collections::HashSet<String> = watch_event
+            .object
+            .spec
+            .drivers
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        self.csi_node_limits.insert(name.clone(), limits);
+        self.csi_node_drivers.insert(name, names);
     }
 
     /// Drop the PVC cache — called on that watch's own reconnect, for the
@@ -2067,6 +2121,7 @@ impl NodeTally {
     /// Drop the CSINode cache — see `clear_pvc_cache`'s doc comment.
     pub fn clear_csi_node_cache(&mut self) {
         self.csi_node_limits.clear();
+        self.csi_node_drivers.clear();
     }
 
     /// Update the node cache from one raw Node watch event — see `nodes`'s
@@ -2438,6 +2493,9 @@ pub fn select_node_with_capacity(
             }
             if !csi_volume_limits_fit(&n.csi_driver_headroom, &pod.csi_volume_counts) {
                 csi_limit_was_the_only_blocker = true;
+                return false;
+            }
+            if !csi_topology_fit(&n.csi_registered_drivers, &pod.unbound_csi_pvc_drivers) {
                 return false;
             }
             true
@@ -3438,6 +3496,14 @@ fn select_and_reserve_node(
             node.csi_driver_headroom = net_csi_headroom(limits, &attached);
         }
     }
+    if !pod.unbound_csi_pvc_drivers.is_empty() {
+        let drivers_by_node = tally_guard.csi_driver_names_by_node();
+        for node in &mut list.items {
+            if let Some(drivers) = drivers_by_node.get(&node.metadata.name) {
+                node.csi_registered_drivers = drivers.clone();
+            }
+        }
+    }
     let node = select_node_with_capacity(list, pod, &usage, &tally_guard.tallied_pod_labels())
         .map_err(|e| {
             debug!(pod = %pod.pod_name, candidates, "pick_node: no node had capacity");
@@ -3658,8 +3724,18 @@ fn find_preemption_candidate(
                 &fresh_csi_headroom_for_node(&tally_guard, node_name),
                 &pod.csi_volume_counts,
             );
+        // Same reasoning as `csi_fits` above, for the topology gate: a node
+        // whose CSINode does not register `pod`'s unbound PVC's driver
+        // cannot serve it no matter which lower-priority pods get evicted,
+        // so it must never be chosen as a preemption target — see
+        // `csi_topology_fit`'s own doc comment.
+        let topology_fits = pod.unbound_csi_pvc_drivers.is_empty()
+            || csi_topology_fit(
+                &fresh_csi_registered_drivers_for_node(&tally_guard, node_name),
+                &pod.unbound_csi_pvc_drivers,
+            );
         drop(tally_guard);
-        if !csi_fits {
+        if !csi_fits || !topology_fits {
             continue;
         }
 
@@ -4451,6 +4527,59 @@ pub async fn fetch_bound_pv_node_affinities(
     Ok(affinities)
 }
 
+const NO_PROVISIONER: &str = "kubernetes.io/no-provisioner";
+
+/// Resolve the CSI driver name for every one of `pvc_names` that is
+/// currently UNBOUND (`spec.volumeName` empty) and backed by a
+/// StorageClass with a real provisioner — the provisioning-time
+/// counterpart to `fetch_bound_pv_node_affinities`'s already-bound case.
+/// Feeds `PendingPod::unbound_csi_pvc_drivers`, which `csi_topology_fit`
+/// then treats as one more mandatory (ANDed) filter: a node whose CSINode
+/// does not register this driver cannot serve whatever volume
+/// csi-provisioner is about to create for it — see `csi_topology_fit`'s own
+/// doc comment for the AnyVolumeDataSource hang this closes.
+///
+/// `kubernetes.io/no-provisioner` is excluded even though it IS a
+/// StorageClass provisioner string: it is the well-known sentinel for "PVs
+/// are created out-of-band, bind to an existing one" (local /
+/// pre-provisioned-volume workflows) — no CSI driver, and therefore no
+/// CSINode entry, will ever exist for it, so gating on CSINode presence
+/// would wedge those PVCs Pending forever instead of letting the ordinary
+/// PV-matching bind proceed.
+///
+/// A GET failure is propagated, not swallowed, for the same reason
+/// `fetch_bound_pv_node_affinities` propagates its own: silently treating
+/// it as "no driver" here would let the scheduler bind the pod onto a node
+/// the eventual volume cannot be mounted on.
+pub async fn fetch_unbound_csi_pvc_drivers(
+    connector: &TlsConnector,
+    server: &str,
+    namespace: &str,
+    pvc_names: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut drivers = Vec::new();
+    for pvc_name in pvc_names {
+        let Some(info) = fetch_pvc_binding_info(connector, server, namespace, pvc_name).await?
+        else {
+            continue;
+        };
+        if !info.volume_name.is_empty() {
+            continue;
+        }
+        let Some(sc_name) = info.storage_class_name.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(provisioner) =
+            fetch_storage_class_provisioner(connector, server, sc_name).await?
+        {
+            if provisioner != NO_PROVISIONER {
+                drivers.push(provisioner);
+            }
+        }
+    }
+    Ok(drivers)
+}
+
 /// Resolve the CSI driver backing `pvc_name` (in `namespace`): prefer its
 /// already-bound PV's `spec.csi.driver`; fall back to its StorageClass's
 /// `provisioner` when unbound, or when the bound PV resolves to no CSI
@@ -4624,6 +4753,51 @@ pub fn csi_volume_limits_fit(
             .get(driver)
             .is_none_or(|&headroom| want <= headroom)
     })
+}
+
+/// `csi_driver_names_by_node`, reading it fresh from `tally` for a SINGLE
+/// node — `find_preemption_candidate`'s per-candidate counterpart to
+/// `fresh_csi_headroom_for_node`, same reasoning: it already holds its own
+/// lock per node (`pods_on`) rather than the one upfront enrichment
+/// `select_and_reserve_node` does on `NodeItem::csi_registered_drivers`.
+fn fresh_csi_registered_drivers_for_node(
+    tally: &NodeTally,
+    node_name: &str,
+) -> std::collections::HashSet<String> {
+    tally
+        .csi_driver_names_by_node()
+        .remove(node_name)
+        .unwrap_or_default()
+}
+
+/// The VolumeBinding-provisioning-topology Filter: true when every CSI
+/// driver `pod`'s own UNBOUND PVCs still need provisioned
+/// (`unbound_csi_pvc_drivers`) is registered in this node's CSINode
+/// (`node_registered_drivers`) — mirrors upstream's VolumeBinding Filter
+/// plugin rejecting a node that cannot possibly serve a provisioning
+/// claim's topology.
+///
+/// Unlike `csi_volume_limits_fit`'s "unknown means unlimited" convention, a
+/// driver absent from `node_registered_drivers` on EVERY node (an empty
+/// candidate set) is NOT permissive here: it correctly rejects every node,
+/// leaving the pod Pending until the driver's own CSINode registration
+/// lands. Treating "driver location unknown" as "any node will do" is
+/// exactly the bug this predicate exists to close — the csi-hostpath CSI
+/// driver runs as a single-replica StatefulSet, so a node picked without
+/// checking CSINode is very likely the wrong one: its PV then carries a
+/// `nodeAffinity` pinning it to the driver's real node, and a pod bound to
+/// any other node fails `MountVolume.NodeAffinity check failed` forever
+/// (the AnyVolumeDataSource conformance hang this predicate fixes).
+///
+/// `pub` (not module-private) for the same reason `csi_volume_limits_fit`
+/// is: a criterion bench may exercise it directly.
+pub fn csi_topology_fit(
+    node_registered_drivers: &std::collections::HashSet<String>,
+    unbound_csi_pvc_drivers: &[String],
+) -> bool {
+    unbound_csi_pvc_drivers
+        .iter()
+        .all(|driver| node_registered_drivers.contains(driver))
 }
 
 /// Bind a pod to a node via POST .../pods/:name/binding.
@@ -6407,6 +6581,7 @@ mod tests {
                     spec: NodeSpec::default(),
                     status: NodeStatus::default(),
                     csi_driver_headroom: Default::default(),
+                    csi_registered_drivers: Default::default(),
                 },
                 NodeItem {
                     metadata: NodeMetadata {
@@ -6416,6 +6591,7 @@ mod tests {
                     spec: NodeSpec::default(),
                     status: NodeStatus::default(),
                     csi_driver_headroom: Default::default(),
+                    csi_registered_drivers: Default::default(),
                 },
             ],
         };
@@ -6517,6 +6693,7 @@ mod tests {
                 spec: NodeSpec::default(),
                 status: NodeStatus::default(),
                 csi_driver_headroom: Default::default(),
+                csi_registered_drivers: Default::default(),
             }],
         };
         let name = select_first_node(list).expect("single-item list must return Ok");
@@ -6542,6 +6719,7 @@ mod tests {
             spec: NodeSpec::default(),
             status: NodeStatus::default(),
             csi_driver_headroom: Default::default(),
+            csi_registered_drivers: Default::default(),
         }
     }
 
@@ -7755,6 +7933,7 @@ mod tests {
                 },
             },
             csi_driver_headroom: Default::default(),
+            csi_registered_drivers: Default::default(),
         }
     }
 
@@ -7793,6 +7972,7 @@ mod tests {
             topology_spread_constraints: Vec::new(),
             csi_volume_counts: Default::default(),
             read_write_once_pod_pvcs: Vec::new(),
+            unbound_csi_pvc_drivers: Vec::new(),
         }
     }
 
@@ -11193,6 +11373,112 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------------
+    // csi_topology_fit / the VolumeBinding provisioning-topology predicate — a
+    // pod whose own unbound PVC still needs a CSI driver provisioned must not
+    // be bound to a node that driver has never registered on (CSINode). The
+    // csi-hostpath e2e driver runs as a single-replica StatefulSet: without
+    // this predicate, a "populate" pod (lib-volume-populator) can land on the
+    // node WITHOUT the driver, its prime PVC's eventual PV gets a nodeAffinity
+    // pinning it to the driver's real node, and the kubelet blocks forever on
+    // `MountVolume.NodeAffinity check failed` — the AnyVolumeDataSource
+    // conformance hang this predicate exists to close.
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn csi_topology_fit_false_when_node_does_not_register_required_driver() {
+        let registered: std::collections::HashSet<String> = Default::default();
+        let wants = vec!["csi-hostpath-provisioning-6547".to_owned()];
+        assert!(
+            !csi_topology_fit(&registered, &wants),
+            "a node whose CSINode does not register the driver a pod's unbound \
+             PVC needs must not be treated as feasible — its eventual PV can \
+             only be mounted where the driver actually runs"
+        );
+    }
+
+    #[test]
+    fn csi_topology_fit_true_when_node_registers_required_driver() {
+        let registered: std::collections::HashSet<String> =
+            ["csi-hostpath-provisioning-6547".to_owned()].into();
+        let wants = vec!["csi-hostpath-provisioning-6547".to_owned()];
+        assert!(
+            csi_topology_fit(&registered, &wants),
+            "a node whose CSINode registers the exact driver a pod's unbound \
+             PVC needs must qualify"
+        );
+    }
+
+    #[test]
+    fn csi_topology_fit_is_true_when_pod_has_no_unbound_csi_pvcs() {
+        let registered: std::collections::HashSet<String> = Default::default();
+        assert!(
+            csi_topology_fit(&registered, &[]),
+            "a pod with no unbound CSI-backed PVCs must never be blocked by \
+             this predicate, regardless of what any node's CSINode registers"
+        );
+    }
+
+    /// Mirrors the AnyVolumeDataSource populate-pod scenario end to end: the
+    /// csi-hostpath driver's single replica registers only on `driver-node`'s
+    /// CSINode, a second node does not — and, the trap that makes this
+    /// fail-on-revert meaningful, the WRONG node is the LESS loaded one, so
+    /// the ordinary least-loaded tie-break would prefer it if the
+    /// `csi_topology_fit` conjunct did not filter it out first.
+    #[test]
+    fn select_node_with_capacity_binds_to_node_registering_unbound_csi_pvcs_driver_over_less_loaded_node(
+    ) {
+        const DRIVER: &str = "csi-hostpath-provisioning-6547";
+        let driver_node = make_node_with_capacity("lima-node-4", &[], "110");
+        let other_node = make_node_with_capacity("lima-node-3", &[], "110");
+        let mut list = NodeList {
+            items: vec![driver_node, other_node],
+        };
+        list.items[0].csi_registered_drivers = [DRIVER.to_owned()].into();
+        let mut pod = empty_pending_pod();
+        pod.unbound_csi_pvc_drivers = vec![DRIVER.to_owned()];
+        let counts: std::collections::HashMap<String, NodeUsage> = [
+            ("lima-node-4".to_owned(), usage_with_pod_count(5)),
+            ("lima-node-3".to_owned(), usage_with_pod_count(0)),
+        ]
+        .into();
+        let result = select_node_with_capacity(list, &pod, &counts, &[]);
+        assert_eq!(
+            result.ok(),
+            Some("lima-node-4".to_owned()),
+            "must bind to the node registering the unbound PVC's CSI driver \
+             even though the other node is less loaded — reverting the \
+             csi_topology_fit conjunct picks lima-node-3 by the ordinary \
+             least-loaded tie-break, exactly the bug that stranded the \
+             lib-volume-populator populate pod on a node without the \
+             csi-hostpath driver and hung the AnyVolumeDataSource e2e test"
+        );
+    }
+
+    /// When NO node has registered the driver yet (e.g. its single-replica
+    /// StatefulSet is still starting), the pod must stay Pending rather than
+    /// be scheduled to an arbitrary node — mirrors upstream: a provisioning
+    /// claim's driver location being unknown is never "any node will do".
+    #[test]
+    fn select_node_with_capacity_leaves_pod_pending_when_no_node_registers_the_required_driver() {
+        let list = NodeList {
+            items: vec![
+                make_node_with_capacity("lima-node-4", &[], "110"),
+                make_node_with_capacity("lima-node-3", &[], "110"),
+            ],
+        };
+        let mut pod = empty_pending_pod();
+        pod.unbound_csi_pvc_drivers = vec!["csi-hostpath-provisioning-6547".to_owned()];
+        let result = select_node_with_capacity(list, &pod, &std::collections::HashMap::new(), &[]);
+        assert!(
+            result.is_err(),
+            "with no node's CSINode registering the driver anywhere, every \
+             node must be rejected — not scheduled to a wrong one — so the \
+             pod stays Pending until the driver's CSINode registration lands: \
+             got {result:?}"
+        );
+    }
+
     #[test]
     fn select_node_with_capacity_rejects_a_node_over_its_csi_attach_limit() {
         // Before CSILimits existed, this scenario (a node with zero remaining
@@ -11782,6 +12068,66 @@ mod tests {
             "evicting the low-priority pod frees a pod-count slot but not any \
              CSI attach headroom, so this node must never be offered as a \
              preemption target: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn find_preemption_candidate_never_preempt_binds_onto_a_node_missing_the_required_csi_driver() {
+        // A node with a lower-priority pod occupying its only pod slot, but
+        // whose CSINode does not register the driver the pending pod's
+        // unbound PVC needs. Evicting the low-priority pod frees the
+        // pod-count slot, but does nothing to make the driver appear on this
+        // node — so this node must stay non-viable, exactly like the
+        // zero-CSI-headroom case above. Without this check, preemption could
+        // evict a real running pod for no benefit: the pending pod still
+        // could not mount its eventual volume here.
+        let node = make_node_with_capacity("lima-node-3", &[], "1");
+        let list = NodeList { items: vec![node] };
+        let node_labels_by_name: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = list
+            .items
+            .iter()
+            .map(|n| (n.metadata.name.clone(), n.metadata.labels.clone()))
+            .collect();
+        let mut tally = NodeTally::default();
+        // lima-node-3 registers no CSI drivers at all — the single-replica
+        // csi-hostpath driver runs on a DIFFERENT node entirely.
+        tally.apply_csi_node_event(&json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "lima-node-3" },
+                "spec": { "drivers": [] }
+            }
+        }));
+        let tally = std::sync::Mutex::new(tally);
+        tally.lock().expect("tally lock poisoned").assume(
+            "default",
+            "low-priority-pod",
+            "lima-node-3",
+            0,
+            ResourceRequests::default(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+        );
+        let tallied_pods = tally
+            .lock()
+            .expect("tally lock poisoned")
+            .tallied_pod_labels();
+
+        let mut pod = empty_pending_pod();
+        pod.priority = 1000;
+        pod.unbound_csi_pvc_drivers = vec!["csi-hostpath-provisioning-6547".to_owned()];
+
+        let result =
+            find_preemption_candidate(&list, &pod, &tallied_pods, &node_labels_by_name, &tally);
+        assert!(
+            result.is_none(),
+            "evicting the low-priority pod frees a pod-count slot but the \
+             driver still never registers on this node, so it must never be \
+             offered as a preemption target: got {result:?}"
         );
     }
 }
