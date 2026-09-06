@@ -9,17 +9,19 @@ this doc does NOT close mayor-88n36. Awaiting operator.
 ## Answer
 
 Do not pick an L7 proxy on folklore RSS numbers. The one thing the cited
-public data settles is the opposite of reassuring: Envoy Gateway's own
-default sizes the Envoy data-plane container at a **512Mi memory request
-— half of a 1GB node** — and the only first-party *measured* Envoy figure
-(Istio, ~60MB) is for a trimmed sidecar under light load, a config an
-ingress with many routes will exceed. No clean first-party *measured
-idle-RSS* number exists in public docs for any of nginx/HAProxy as raw
-processes; what's publishable is vendor-default resource *requests*
-(sizing defaults, not RSS) plus one measured Envoy datapoint. This is the
-same trap the ServiceLB ADR already hit with loxilb — "expected to fit,"
-then ENOMEM crash-loop on a real 1 CPU/1GiB Lima VM
-(`docs/decisions/servicelb-ebpf-geneve-dataplane.md:35`). The proxy
+public data settles is the opposite of reassuring, and it is not unique to
+one proxy: Envoy Gateway's own default sizes the Envoy data-plane container
+at a **512Mi memory request — half of a 1GB node** — and HAProxy's own
+static ingress manifest (its "Basic setup") sizes the controller at a
+**2048Mi request / 2560Mi limit — more than 2× a 1GB node**, worse than
+Envoy's. The only first-party *measured* Envoy figure (Istio, ~60MB) is for
+a trimmed sidecar under light load, a config an ingress with many routes
+will exceed. No clean first-party *measured idle-RSS* number exists in
+public docs for any of nginx/HAProxy as raw processes; what's publishable is
+vendor-default resource *requests* (sizing defaults, not RSS) plus one
+measured Envoy datapoint. This is the same trap the ServiceLB ADR already
+hit with loxilb — "expected to fit," then ENOMEM crash-loop on a real 1 CPU/1GiB
+Lima VM (`docs/decisions/servicelb-ebpf-geneve-dataplane.md:36-38`). The proxy
 choice must wait on the real measurement whose method is specified below.
 
 ## Scope and why this exists
@@ -65,16 +67,18 @@ raw files cached under `temp/research/`.
 | NGINX Gateway Fabric | data plane = **OSS nginx by default** (`plus: false`); so data-plane RSS ≈ OSS nginx. Helm sets **`resources: {}` for BOTH** control and data plane (no default) | [vendor-default: none] | `nginx/nginx-gateway-fabric` `charts/nginx-gateway-fabric/values.yaml`: `nginx.plus=false`, `nginx.resources={}`, `nginxGateway.resources={}` |
 | NGINX Gateway Fabric | control plane = separate Go pod (`nginxGateway` container), off the data path — its own RSS, additive to the nginx data-plane pod | [vendor-default: none] | same values.yaml (two separate Deployments) |
 | HAProxy (k8s ingress controller pod) | **400Mi memory request** (CPU 250m) — controller container bundles the Go controller + haproxy | [vendor-default] | `haproxytech/helm-charts` `kubernetes-ingress/values.yaml` `controller.resources.requests` |
+| HAProxy (k8s ingress "Basic setup" static manifest) | **2048Mi memory request / 2560Mi limit** — the vendor's static `deploy/haproxy-ingress.yaml`; **>2× a 1GiB node**, and 5× the same vendor's Helm-chart request | [vendor-default] | `haproxytech/kubernetes-ingress` `deploy/haproxy-ingress.yaml` (cached `temp/research/haproxy-ingress-deploy.yaml`) |
 | HAProxy (raw) | small base; memory scales per-connection (~`tune.bufsize`×2, default bufsize 16KB) | [behavioral] | `haproxy/haproxy` docs (`doc/management.txt` §6 memory management; `doc/configuration.txt` `tune.bufsize`) |
 | HAProxy | "lightest" | [folklore] | prior finding, uncited |
 
 Reading the table: the only cross-project figures that exist as
-published data are the vendor-default *requests* (512Mi / 90Mi / 400Mi /
-none-none) and Istio's single measured Envoy sidecar (~60MB). None is an
-idle-RSS measurement of the artifact u7s would actually run. Vendor
-requests are set with wildly different conservatism per project and must
-NOT be read as RSS or compared as such — they bound expectations, not
-actuals.
+published data are the vendor-default *requests* (Envoy 512Mi / nginx 90Mi /
+HAProxy 400Mi Helm or 2048Mi–2560Mi static / NGF none-none) and Istio's
+single measured Envoy sidecar (~60MB). None is an idle-RSS measurement of
+the artifact u7s would actually run. Vendor requests are set with wildly
+different conservatism per project — and, as HAProxy's own 400Mi-Helm vs
+2048Mi-static split shows, even within a single project — so they must NOT
+be read as RSS or compared as such; they bound expectations, not actuals.
 
 ## Can the existing finding's uncited numbers be substantiated?
 
@@ -203,7 +207,7 @@ measurement, not estimate.
 - `temp/research/haproxy-helm-values.yaml` — `haproxytech/helm-charts`
   kubernetes-ingress values (400Mi request).
 - `temp/research/haproxy-ingress-deploy.yaml` — `haproxytech/kubernetes-ingress`
-  static deploy manifest (no resources set).
+  static deploy manifest ("Basic setup"; 2048Mi memory request / 2560Mi limit).
 - Envoy Gateway 512Mi default: `envoyproxy/gateway`
   `api/v1alpha1/shared_types.go` + `api/v1alpha1/kubernetes_helpers.go`
   (fetched via `gh api`, default branch, 2026-09-06; not cached as a file).

@@ -73,7 +73,7 @@ convention originates in `resource.rs` `do_patch`.
 **Class C — read/reconcile-path defense-in-depth coercions.** Before an in-place
 stamp, coerce a (hypothetically corrupted) scalar status back to `{}`:
 `generic.rs:720` (namespace Terminating stamp), the ResourceQuota reconciler
-(`lib.rs:11858`), the APIService reconcile (`aggregation.rs`).
+(`lib.rs:3494`), the APIService reconcile (`aggregation.rs`).
 
 Plus **three completeness meta-tests** in `status.rs` (~350 LOC) that grep every
 handler file and fail if a new PUT/PATCH/main-resource write handler is added
@@ -97,7 +97,7 @@ Approximate production guard-call inventory (grep, excludes test modules):
 | crd.rs | 2 | 9 | **dynamic** (CRD) |
 | cr.rs | 2 | 10 | **dynamic** (CR) |
 
-Read-path Class-C coercions: `generic.rs` ×2, `aggregation.rs` ×1, `lib.rs` ×1.
+Read-path Class-C coercions: `generic.rs` ×1 (`generic.rs:720-721`), `aggregation.rs` ×1, `lib.rs` ×1 (`lib.rs:3494`).
 
 ## 3. Built-in status types: typed vs raw-Value today
 
@@ -111,7 +111,8 @@ object-or-null invariant because generic stampers coexist in the same object.
 |---|---|---|---|---|
 | Namespace | **Typed** (`NamespaceStatus`) | namespaces.rs `put/patch_namespace_status` (typed); `patch_namespace` (raw, Class-B); `generic.rs` Terminating stamp (Class-C) | Yes (phase, finalize conditions) | Yes — model already exists |
 | CertificateSigningRequest | **Typed** (`CertificateSigningRequestStatus`) | approval.rs `patch_approval` / `merge_approval_conditions` (typed); status.rs generic (raw) | Yes (approval conditions, certificate) | Yes — model already exists |
-| HorizontalPodAutoscaler (Scale) | **Typed** (`Scale`) | scale.rs (typed) | Yes (scale.status.replicas) | Yes — model already exists |
+| Scale subresource (Deployment/ReplicaSet/StatefulSet/ReplicationController) | **Typed** (`Scale`) | scale.rs (typed) | Yes (scale.status.replicas) | Yes — model already exists |
+| HorizontalPodAutoscaler | Raw | status.rs generic (its own `/status`; no `/scale` route) | Passthrough (HPA controller writes status) | Yes |
 | Pod | Partial | pods.rs `replace_pod_status`/`patch_pod_status`/`patch_pod_resize` (mix: resize typed, main raw Class-B) | Yes (resize, readiness conditions, phase) | Yes — high value |
 | APIService | Raw | aggregation.rs reconcile `upsert_available_condition` (raw); status.rs generic | Yes (Available condition) | Yes — high value |
 | ResourceQuota | Raw | status.rs generic; reconciler coercion (`lib.rs`, Class-C) | Yes (usage) | Yes — high value |
@@ -127,9 +128,15 @@ object-or-null invariant because generic stampers coexist in the same object.
 | ValidatingAdmissionPolicy / ...Binding | Raw | status.rs generic | Passthrough | Yes |
 | ResourceClaim / DeviceClass / PodCertificateRequest | Raw | status.rs generic | Passthrough (DRA/cert ctrl) | Yes |
 
-**Score: 3 built-in status types typed today (Namespace, CSR, Scale); ~23 raw.
-All ~26 are typeable end-to-end.** Dynamic CR/CRD status is NOT typeable (no
-compile-time schema) and keeps the structural invariant.
+**Score: 3 typed round-trip paths today — Namespace status (`NamespaceStatus`),
+CSR status (`CertificateSigningRequestStatus`), and the `Scale` subresource
+(`Scale`), which exists ONLY on Deployment/ReplicaSet/StatefulSet/ReplicationController
+and NOT on HorizontalPodAutoscaler. Of the built-in status subresources themselves,
+only Namespace and CSR are typed; the rest — including HorizontalPodAutoscaler,
+whose own `/status` is raw through the generic status handler (its only
+`HorizontalPodAutoscalerStatus` type is prost-generated, not a hand-written serde
+struct) — are raw. All are typeable end-to-end.** Dynamic CR/CRD status is NOT
+typeable (no compile-time schema) and keeps the structural invariant.
 
 ## 4. Feasibility given the Value-based store
 
@@ -220,10 +227,10 @@ conditions). These are where the typing-guideline bites hardest.
 
 **Phase 3 — Passthrough-status built-ins (bulk).** Author minimal-field structs
 for Deployment / ReplicaSet / StatefulSet / DaemonSet, Job / CronJob, PV / PVC,
-ReplicationController, Ingress, VolumeAttachment, FlowSchema / PLC, ServiceCIDR,
-ValidatingAdmissionPolicy(+Binding), ResourceClaim / DeviceClass /
-PodCertificateRequest. Each is minimal field + `flatten rest`. Wire each into the
-dispatch table.
+ReplicationController, HorizontalPodAutoscaler, Ingress, VolumeAttachment,
+FlowSchema / PLC, ServiceCIDR, ValidatingAdmissionPolicy(+Binding), ResourceClaim /
+DeviceClass / PodCertificateRequest. Each is minimal field + `flatten rest`. Wire
+each into the dispatch table.
 
 **Phase 4 — Retire the guard class for built-ins.** Once every built-in path is
 typed: drop `reject_non_object_status` / `replace_status_field` / `stored_status`
