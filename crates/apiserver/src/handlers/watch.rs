@@ -558,16 +558,27 @@ fn parse_set_values(s: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Shared label-selector decision logic, parameterized over how to look up a label's value so
-/// `object_matches_label_selector` (full `Value`) and `SelectorProjection::matches` (the
-/// cheap pre-parse projection below) evaluate the exact same operators against the exact same
-/// data — a hand-duplicated second copy of this logic is exactly the kind of drift that would
-/// make a selector'd watch's projection-based pre-filter and its full-object filter disagree.
+/// Shared label-selector decision logic, parameterized over how to look up a label's presence
+/// and value so `object_matches_label_selector` (full `Value`) and `SelectorProjection::matches`
+/// (the cheap pre-parse projection below) evaluate the exact same operators against the exact
+/// same data — a hand-duplicated second copy of this logic is exactly the kind of drift that
+/// would make a selector'd watch's projection-based pre-filter and its full-object filter
+/// disagree.
+///
+/// `has_key` and `label` are separate (rather than deriving presence from `label(key).is_some()`)
+/// because Exists/DoesNotExist must key off whether the label is present at all, not whether its
+/// value happens to be a string: a stored `metadata.labels` value that isn't a JSON string (e.g.
+/// `null`) still counts as present for `!key`/bare `key`, even though `label(key)` returns `None`
+/// for it the same as a genuinely absent key.
 ///
 /// Supported operators: `key=value` (Equality), `key!=value` (NotEquals),
 /// `!key` (DoesNotExist), bare `key` (Exists),
 /// `key in (v1,v2)` (In), `key notin (v1,v2)` (NotIn).
-fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a str>) -> bool {
+fn label_selector_matches<'a>(
+    selector: &str,
+    has_key: impl Fn(&str) -> bool,
+    label: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
     if selector.is_empty() {
         return true;
     }
@@ -580,7 +591,7 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
             if key.is_empty() {
                 continue;
             }
-            if label(key).is_some() {
+            if has_key(key) {
                 return false;
             }
             continue;
@@ -633,7 +644,7 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
         if key.is_empty() {
             continue;
         }
-        if label(key).is_none() {
+        if !has_key(key) {
             return false;
         }
     }
@@ -645,7 +656,11 @@ fn label_selector_matches<'a>(selector: &str, label: impl Fn(&str) -> Option<&'a
 /// `metadata.labels` in the object. Used to filter live watch events.
 pub(crate) fn object_matches_label_selector(obj: &serde_json::Value, selector: &str) -> bool {
     let labels = &obj["metadata"]["labels"];
-    label_selector_matches(selector, |key| labels.get(key).and_then(|v| v.as_str()))
+    label_selector_matches(
+        selector,
+        |key| labels.get(key).is_some(),
+        |key| labels.get(key).and_then(|v| v.as_str()),
+    )
 }
 
 /// Shared field-selector decision logic, parameterized over the three fields it ever reads —
@@ -744,13 +759,16 @@ struct SelectorProjectionSpec<'a> {
 
 impl SelectorProjection<'_> {
     fn matches(&self, label_selector: &str, field_selector: &str) -> bool {
-        label_selector_matches(label_selector, |key| self.metadata.labels.get(key).copied())
-            && field_selector_matches_parts(
-                field_selector,
-                self.metadata.name,
-                self.metadata.namespace,
-                self.spec.node_name,
-            )
+        label_selector_matches(
+            label_selector,
+            |key| self.metadata.labels.contains_key(key),
+            |key| self.metadata.labels.get(key).copied(),
+        ) && field_selector_matches_parts(
+            field_selector,
+            self.metadata.name,
+            self.metadata.namespace,
+            self.spec.node_name,
+        )
     }
 }
 
@@ -2217,6 +2235,44 @@ mod tests {
             "prepare_fast_live_event must skip (return None) for invalid UTF-8 rather than \
              embedding raw garbage bytes into the NDJSON stream, which would break every client \
              parsing the watch response"
+        );
+    }
+
+    /// Reachability pin for the zero-parse fast path: the test above (and
+    /// `watch_generic_no_selector_fast_path_emits_byte_correct_added_event`) build their fixture
+    /// with already-alphabetical key order, so `serde_json`'s BTreeMap-backed `Value::Object`
+    /// reserializes it identically whether or not it was ever parsed — a silent revert that
+    /// routes every event back through the slow `prepare_live_event` parse+reserialize path
+    /// would NOT fail either test. This fixture instead uses deliberately non-alphabetical key
+    /// order at both the top level (`kind` before `apiVersion`) and inside `metadata`
+    /// (`resourceVersion` before `namespace`/`name`): the raw fast path echoes the stored bytes
+    /// verbatim, preserving that order, while the slow path always emits keys alphabetically.
+    /// Asserting the original (unsorted) order is therefore an observable side effect that only
+    /// the raw path produces, proving it was actually taken rather than just happening to agree.
+    #[test]
+    fn prepare_fast_live_event_reachability_preserves_non_alphabetical_key_order() {
+        let obj_json = r#"{"kind":"ConfigMap","apiVersion":"v1","metadata":{"resourceVersion":"42","namespace":"default","name":"cm"}}"#;
+        let expected = format!("{{\"type\":\"MODIFIED\",\"object\":{obj_json}}}\n");
+
+        let got = prepare_fast_live_event(
+            obj_json.as_bytes(),
+            "MODIFIED",
+            "",
+            "configmaps",
+            "v1",
+            "ConfigMap",
+            false,
+        )
+        .expect("valid UTF-8 JSON with already-canonical type meta must produce a chunk");
+
+        assert_eq!(
+            got.as_ref(),
+            expected.as_bytes(),
+            "prepare_fast_live_event must preserve the stored bytes' original key order \
+             verbatim; a full parse into serde_json::Value re-sorts keys alphabetically via its \
+             BTreeMap-backed Map, so if this fails because keys got reordered, the zero-parse \
+             fast path was silently bypassed in favor of the slow parse+reserialize path — \
+             exactly the routing regression this test exists to catch"
         );
     }
 
@@ -4077,6 +4133,29 @@ mod tests {
         assert!(
             !object_matches_label_selector(&no_labels, "app"),
             "object with no labels must NOT match Exists selector"
+        );
+    }
+
+    /// Exists/DoesNotExist must key off whether the label is present at all, not whether its
+    /// value happens to be a JSON string. Consolidating the per-function matchers into the
+    /// shared `label_selector_matches` narrowed this to string-presence (via
+    /// `.and_then(|v| v.as_str())`), diverging from the pre-refactor code's Value-presence
+    /// check (`labels.get(key).is_some()`); a present-but-non-string label value (e.g. `null`)
+    /// would then wrongly fail Exists and wrongly pass DoesNotExist.
+    #[test]
+    fn label_selector_exists_and_does_not_exist_use_value_presence_not_string_presence() {
+        let non_string_value = serde_json::json!({"metadata": {"labels": {"app": null}}});
+
+        assert!(
+            object_matches_label_selector(&non_string_value, "app"),
+            "a present-but-non-string label value must still satisfy Exists(key) — narrowing \
+             to string-presence would wrongly drop this object from the watch"
+        );
+        assert!(
+            !object_matches_label_selector(&non_string_value, "!app"),
+            "a present-but-non-string label value must still count as 'exists' for \
+             DoesNotExist(!key), i.e. the selector must NOT match — narrowing to \
+             string-presence would wrongly deliver this object to a watcher filtering it out"
         );
     }
 
