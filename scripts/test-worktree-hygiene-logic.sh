@@ -262,6 +262,47 @@ assert "a branch that is ahead (not gone) is NOT matched" \
   "$(! printf '%s\n' "$GONE" | grep -qxF 'main' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
+# 4b. STEP D -- checked-out guard, exercised end-to-end (not via a
+#    reimplemented text check) against a disposable sandbox repo with a real
+#    worktree, since the bug is a genuine `git branch -d` refusal, not a
+#    text-matching mistake. Regression: observed 2026-09-06 twice (PRs
+#    #1595, #1599) -- a worker branch's upstream goes `[gone]` the instant
+#    the merge queue deletes its remote head, which can race ahead of the
+#    tick that reaps its worktree. Unlike STEP C, STEP D had no
+#    is_checked_out guard, so `git branch -d` on that still-checked-out
+#    branch made git refuse, and this script's `set -e` turned that refusal
+#    into a whole-run abort (skipping STEP E) on what is actually a benign,
+#    self-resolving race.
+# ---------------------------------------------------------------------------
+
+BARE_D="$SANDBOX_ROOT/origin-d.git"
+git init -q --bare "$BARE_D"
+
+D="$SANDBOX_ROOT/step-d-repo"
+new_sandbox "$D"
+printf 'line one\n' > "$D/file.txt"
+git -C "$D" add -A
+git -C "$D" commit -q -m initial
+git -C "$D" remote add origin "$BARE_D"
+git -C "$D" push -q origin main
+
+# A branch checked out in a second worktree, then merged and its remote
+# head deleted -- exactly the merge-queue race: local upstream tracking
+# still points at origin/worker/agent-gone, but that ref is gone.
+git -C "$D" branch worker/agent-gone main
+git -C "$D" push -q -u origin worker/agent-gone
+git -C "$D" worktree add -q "$SANDBOX_ROOT/step-d-worktree" worker/agent-gone
+git -C "$D" push -q origin --delete worker/agent-gone
+git -C "$D" fetch -q --prune origin
+
+RC=0
+WORKTREE_HYGIENE_REPO_ROOT="$D" call step_d_gone_upstream_branches >/dev/null 2>&1 || RC=$?
+assert "STEP D does not abort the whole hygiene tick (skipping STEP E) when a gone-upstream branch is still checked out in a live worktree" \
+  "$([ "$RC" -eq 0 ] && echo 1 || echo 0)"
+assert "...and the branch itself survives -- skipped for the tick's reap, not force-deleted out from under the live worktree" \
+  "$(git -C "$D" branch --list worker/agent-gone | grep -q worker/agent-gone && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
 # 5. run_cmd dry-run gate -- the mechanism that keeps THIS test suite (and
 #    any manual dry-run) from ever killing a real process or deleting a
 #    real branch.
