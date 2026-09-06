@@ -1246,6 +1246,15 @@ async fn delete_namespace_scoped_crds<S: Store>(state: &AppState<S>, namespace_n
                 .invalidate_by_target_api_versions(&target_api_versions);
         }
 
+        // Mirrors crd::delete_crd's eager watch-ring-shard eviction: without it, this
+        // cascade-delete path leaves the deleted namespace-scoped CRD's shard alive until
+        // idle-GC reclaims it after RING_SHARD_IDLE_GRACE (120s) instead of freeing it now.
+        if !plural.is_empty() {
+            state
+                .store
+                .evict_resource_type(&crate::keys::group_list_prefix(&group, &plural, None));
+        }
+
         let tombstone_key = crate::handlers::crd::deleted_group_tombstone_key(&group);
         let tombstone_val =
             serde_json::to_vec(&serde_json::json!({ "group": &group })).unwrap_or_default();
@@ -4429,6 +4438,96 @@ mod tests {
              delete_namespace_scoped_crds -- a stale DiscoveryCache entry here is exactly what \
              makes KCM's namespace-controller keep rediscovering the tombstoned group and \
              requeue the namespace drain forever"
+        );
+    }
+
+    /// This is the direct-store-write cascade-delete path (not `crd::delete_crd`'s HTTP path),
+    /// so it must independently free the deleted namespace-scoped CRD's watch-ring shard, not
+    /// just refresh the discovery cache (covered by the test above).
+    ///
+    /// Fails on revert: without the `evict_resource_type` call, the shard stays live and quiet
+    /// (it never evicted anything on its own, so `compaction_horizon_for` stays 0 after
+    /// delete), pinning the shard's ring capacity until idle-GC's RING_SHARD_IDLE_GRACE (120s)
+    /// elapses instead of being freed immediately — mirrors
+    /// `crd::delete_crd_evicts_watch_ring_shard_immediately`.
+    #[tokio::test]
+    async fn delete_namespace_scoped_crds_evicts_watch_ring_shard_immediately() {
+        use std::sync::Arc;
+        use u7s_store::SqliteStore;
+
+        let store = Arc::new(SqliteStore::new(":memory:").expect("in-memory store"));
+        let state = crate::handlers::test_support::make_state_with_store(store.clone());
+
+        let namespace_name = "nscrd-shard-test";
+        let group = format!("stable.{namespace_name}.example.com");
+        let plural = "crontabs";
+        let prefix = crate::keys::group_list_prefix(&group, plural, None);
+
+        assert!(
+            crate::handlers::crd::create_crd(
+                State(state.clone()),
+                test_user(),
+                axum::http::HeaderMap::new(),
+                Bytes::from(
+                    serde_json::json!({
+                        "apiVersion": "apiextensions.k8s.io/v1",
+                        "kind": "CustomResourceDefinition",
+                        "metadata": { "name": format!("{plural}.{group}") },
+                        "spec": {
+                            "group": group,
+                            "names": {
+                                "plural": plural,
+                                "singular": "crontab",
+                                "kind": "CronTab",
+                                "listKind": "CronTabList"
+                            },
+                            "scope": "Namespaced",
+                            "versions": [{ "name": "v1", "served": true, "storage": true }]
+                        }
+                    })
+                    .to_string(),
+                ),
+            )
+            .await
+            .is_ok(),
+            "install namespace-scoped CRD whose group embeds the namespace name"
+        );
+
+        // Opening a watch is what brings a shard into existence (writes alone do not).
+        let watch_stream = store.watch(&prefix, 0).await.expect("watch must succeed");
+        drop(watch_stream);
+
+        // One real CR write, nowhere near RING_CAPACITY, so the shard's own eviction floor
+        // (`horizon`) never advances past 0 on its own — isolating "torn down" from "compacted".
+        let cr_key = format!("{prefix}{namespace_name}/cron-a");
+        let rv = store
+            .put(
+                &cr_key,
+                Bytes::from(
+                    serde_json::json!({"metadata": {"name": "cron-a", "namespace": namespace_name}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await
+            .expect("CR write must succeed");
+
+        assert_eq!(
+            store.compaction_horizon_for(&prefix),
+            0,
+            "sanity check on test setup: a quiet shard that never evicted anything must report \
+             horizon 0 while it is still live"
+        );
+
+        delete_namespace_scoped_crds(&state, namespace_name).await;
+
+        assert_eq!(
+            store.compaction_horizon_for(&prefix),
+            rv,
+            "delete_namespace_scoped_crds must eagerly free the resource-type shard rather than \
+             waiting 120s for idle-GC, the same as crd::delete_crd does on its HTTP path -- \
+             otherwise every namespace-scoped CRD deleted via namespace cascade-delete pins its \
+             watch-ring shard in memory until the idle-GC grace period expires"
         );
     }
 
