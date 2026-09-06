@@ -409,17 +409,21 @@ const RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Path the periodic resync GETs on every `RESYNC_INTERVAL` tick.
 ///
-/// Deliberately NOT `fieldSelector=spec.nodeName=`: the store's fast-path
-/// field-selector match compares against SQL `json_extract`, which yields
-/// SQL-NULL (never equal to anything, including `''`) for a pod whose
-/// `spec.nodeName` key is entirely absent — and an unscheduled pod's
-/// `nodeName` is always absent, never present-and-empty, because it's an
-/// `Option<String>` with `skip_serializing_if` on the wire. A `nodeName=`
-/// selector therefore matches zero pods in a real cluster, silently
-/// disabling this resync's stranded-pod safety net. Every pod is listed
-/// here and filtered in-process by `pods_needing_resync` instead, which
-/// already handles the absent-vs-empty distinction correctly.
-const RESYNC_PODS_PATH: &str = "/api/v1/pods";
+/// `fieldSelector=spec.nodeName=` pre-filters server-side to unscheduled
+/// pods: the store's `spec.nodeName` fast-path matches an empty selector
+/// value against both SQL-equal-to-`''` AND SQL-NULL, so it correctly
+/// selects a pod whose `nodeName` key is entirely absent — the actual
+/// on-the-wire shape of every real unscheduled pod (`Option<String>` with
+/// `skip_serializing_if`). This cuts the resync's wire transfer to just the
+/// pods it can possibly act on, instead of every pod in the cluster
+/// (most of which are already scheduled) on every 30s tick.
+///
+/// This is a wire-transfer optimization, not a replacement for
+/// `pods_needing_resync`'s in-process filter: the server-side selector only
+/// narrows by `spec.nodeName`, while `pods_needing_resync` additionally
+/// excludes scheduling-gated pods and pods already `in_flight`, so it still
+/// runs on the (now smaller) result set below.
+const RESYNC_PODS_PATH: &str = "/api/v1/pods?fieldSelector=spec.nodeName%3D";
 
 /// Path for the scheduler's cluster-wide pod watch. `allowWatchBookmarks=true`
 /// requests the apiserver's 60s bookmark heartbeat so `watch_stream`'s 5-min
@@ -1207,19 +1211,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn resync_pods_path_has_no_field_selector() {
-        // A `fieldSelector=spec.nodeName=` here would ask the store to match
-        // pods whose nodeName is SQL-equal to the empty string — but a real
-        // unscheduled pod's nodeName key is entirely ABSENT (Option<String>
-        // + skip_serializing_if), which the store's json_extract path reads
-        // back as SQL NULL, never equal to anything. That selector matched
-        // zero real pods, silently disabling this resync's stranded-pod
-        // safety net. Every pod must be listed here and filtered in-process
-        // instead (see `pods_needing_resync`).
+    fn resync_pods_path_filters_to_unscheduled_pods_server_side() {
+        // The store's spec.nodeName fast-path matches an empty selector
+        // value against both SQL-equal-to-'' and SQL-NULL, so this selector
+        // correctly narrows the resync GET to unscheduled pods (nodeName key
+        // absent, the real shape of every such pod) instead of transferring
+        // every pod in the cluster on every 30s tick. Losing this selector
+        // reintroduces the wire-transfer cost this resync is meant to avoid.
         assert!(
-            !RESYNC_PODS_PATH.contains("fieldSelector"),
-            "resync must list the full pod collection, not filter server-side \
-             on a selector the store cannot match against an absent field; \
+            RESYNC_PODS_PATH.contains("fieldSelector=spec.nodeName%3D"),
+            "resync must pre-filter to unscheduled pods server-side; \
              got: {RESYNC_PODS_PATH}"
         );
     }
