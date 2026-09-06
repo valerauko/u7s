@@ -1625,6 +1625,11 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         }
 
         // Indexed fast-path: spec.nodeName on pods — uses the partial index.
+        //
+        // An empty selector value must match pods whose nodeName key is absent/null
+        // (unscheduled pods) to align with the in-memory `pod_matches_field_selector`
+        // and k8s semantics (`spec.nodeName=` selects unscheduled pods). Plain SQL
+        // equality against NULL never matches, so that case needs an explicit OR.
         Some(FieldSelector {
             field,
             value,
@@ -1635,7 +1640,8 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                 query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
-                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
+                     OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
                      ORDER BY key ASC",
                     &[&like_prefix, value as &dyn rusqlite::ToSql],
                 )?
@@ -1643,7 +1649,8 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                 query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
-                     WHERE key LIKE ?1 AND json_extract(value, '$.spec.nodeName') = ?2 \
+                     WHERE key LIKE ?1 AND (json_extract(value, '$.spec.nodeName') = ?2 \
+                     OR (?2 = '' AND json_extract(value, '$.spec.nodeName') IS NULL)) \
                      AND key > ?3 ORDER BY key ASC",
                     &[&like_prefix, value as &dyn rusqlite::ToSql, &ck],
                 )?
@@ -3210,6 +3217,81 @@ mod tests {
             "field-selector list by namespace=prod must return 1 pod; returning 0 means the \
              ns indexed column was not correctly populated by the single-parse put path, \
              breaking all namespace-scoped list queries"
+        );
+    }
+
+    /// The spec.nodeName SQL fast-path must match unscheduled pods (no nodeName key) against
+    /// an empty-value selector, and must still match only the exact value for a real selector.
+    ///
+    /// Why it matters: `fieldSelector=spec.nodeName=` is k8s shorthand for "unscheduled pods"
+    /// and backs the scheduler's stranded-pod safety net. `json_extract(...) = ?` is SQL-NULL
+    /// (never true) for an absent key, so a naive fast-path silently returns zero pods for that
+    /// query — the safety net finds nothing to reconcile and stranded pods are never rescheduled.
+    #[tokio::test]
+    async fn nodename_fast_path_empty_selector_matches_unscheduled_pods() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        store
+            .put(
+                "/registry/pods/default/unscheduled",
+                Bytes::from(r#"{"metadata":{"name":"unscheduled","namespace":"default"}}"#),
+                None,
+            )
+            .await
+            .expect("put unscheduled pod");
+        store
+            .put(
+                "/registry/pods/default/scheduled",
+                Bytes::from(
+                    r#"{"metadata":{"name":"scheduled","namespace":"default"},"spec":{"nodeName":"node-1"}}"#,
+                ),
+                None,
+            )
+            .await
+            .expect("put scheduled pod");
+
+        let unscheduled = store
+            .list(
+                "/registry/pods/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "spec.nodeName".to_string(),
+                        value: String::new(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with empty-value nodeName selector");
+        assert_eq!(
+            unscheduled.items.len(),
+            1,
+            "spec.nodeName= must match the pod with no nodeName key; if the SQL fast-path \
+             compares json_extract's NULL to '' with plain equality it matches nothing and the \
+             scheduler's stranded-pod safety net stalls forever"
+        );
+
+        let scheduled = store
+            .list(
+                "/registry/pods/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "spec.nodeName".to_string(),
+                        value: "node-1".to_string(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with real-value nodeName selector");
+        assert_eq!(
+            scheduled.items.len(),
+            1,
+            "spec.nodeName=node-1 must match only the pod scheduled to node-1, not the \
+             unscheduled pod; the empty-value OR clause must not widen the common (real value) \
+             match path"
         );
     }
 
