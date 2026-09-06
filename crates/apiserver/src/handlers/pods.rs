@@ -5145,19 +5145,36 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         pod["spec"]["terminationGracePeriodSeconds"] = serde_json::json!(30);
     }
 
-    // serviceAccountName: default to "default" when absent or empty, mirroring
-    // upstream's ServiceAccount admission plugin. client-go's token-fetch machinery
-    // rejects an empty resource name ("failed to fetch token: resource name may not
-    // be empty"), so a pod with no serviceAccountName can never start — the kubelet
-    // needs a real name to request the projected SA token for. This also unblocks
-    // inject_sa_token_volume below, which only fires when serviceAccountName is set.
+    // serviceAccountName: when absent or empty, fall back to the deprecated
+    // spec.serviceAccount alias before defaulting to "default", mirroring upstream's
+    // Convert_v1_PodSpec_To_core_PodSpec ("We support DeprecatedServiceAccount as an
+    // alias for ServiceAccountName. If both are specified, ServiceAccountName (the new
+    // field) wins") followed by the ServiceAccount admission plugin's unconditional
+    // "default" fallback. Manifests that only set the legacy `serviceAccount` field
+    // (e.g. upstream's hello-populator-deploy.yaml) would otherwise silently run under
+    // the RBAC-less "default" SA and get instant 403s on every apiserver call.
+    // client-go's token-fetch machinery also rejects an empty resource name
+    // ("failed to fetch token: resource name may not be empty"), so a pod with no
+    // resolved serviceAccountName can never start — the kubelet needs a real name to
+    // request the projected SA token for. This also unblocks inject_sa_token_volume
+    // below, which only fires when serviceAccountName is set.
     if pod["spec"]["serviceAccountName"]
         .as_str()
         .unwrap_or("")
         .is_empty()
     {
-        pod["spec"]["serviceAccountName"] = serde_json::json!("default");
+        let alias = pod["spec"]["serviceAccount"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        pod["spec"]["serviceAccountName"] =
+            serde_json::json!(alias.unwrap_or_else(|| "default".to_string()));
     }
+    // Convert_core_PodSpec_To_v1_PodSpec unconditionally backfills the deprecated
+    // alias from the resolved ServiceAccountName, so the two fields never diverge in
+    // an object a client reads back — even if the client originally sent a
+    // conflicting `serviceAccount` value alongside an explicit `serviceAccountName`.
+    pod["spec"]["serviceAccount"] = pod["spec"]["serviceAccountName"].clone();
 
     // defaultMode for volume sources that require it.
     // The kubelet refuses to mount ConfigMap/Secret/DownwardAPI volumes whose defaultMode is
@@ -6862,6 +6879,36 @@ mod create_defaults_tests {
         assert_eq!(
             pod["spec"]["serviceAccountName"], "default",
             "empty-string serviceAccountName must be treated as absent and defaulted"
+        );
+    }
+
+    /// A pod that sets only the deprecated `serviceAccount` alias must resolve
+    /// serviceAccountName to that value, not "default".
+    ///
+    /// Upstream's hello-populator-deploy.yaml (AnyVolumeDataSource conformance) sets
+    /// only `serviceAccount: hello-account`, never `serviceAccountName`. Before this
+    /// fix, apply_pod_spec_defaults ignored the alias and stamped "default" — the
+    /// populator controller then ran as the RBAC-less default SA and got instant 403
+    /// Forbidden on every list/watch call, so its informer caches never synced and it
+    /// never provisioned the datasource volume, hanging the conformance test.
+    #[test]
+    fn service_account_name_falls_back_to_deprecated_alias() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "serviceAccount": "hello-account",
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["serviceAccountName"], "hello-account",
+            "a pod using only the deprecated serviceAccount alias must run under that \
+             SA's RBAC identity, not the powerless default SA"
+        );
+        assert_eq!(
+            pod["spec"]["serviceAccount"], "hello-account",
+            "upstream keeps the deprecated alias in sync with the resolved \
+             serviceAccountName so clients reading the pod back see both fields agree"
         );
     }
 
