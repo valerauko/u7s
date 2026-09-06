@@ -1585,6 +1585,13 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
         }
 
         // SQL index fast-path: metadata.namespace=<value> — uses idx_ns index.
+        //
+        // An empty selector value must match cluster-scoped objects (no `ns` column, since
+        // they have no `metadata.namespace`) to align with the in-memory `json_path_equals`
+        // fallback and k8s semantics (metadata.namespace is a generic selectable field on
+        // every type, including cluster-scoped ones like Node/PersistentVolume/Namespace
+        // itself). Plain SQL equality against NULL never matches, so that case needs an
+        // explicit OR.
         Some(FieldSelector {
             field,
             value,
@@ -1595,14 +1602,15 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                     query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
-                         WHERE key >= ?1 AND ns = ?2 ORDER BY key ASC",
+                         WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql],
                     )?
                 } else {
                     query_all(
                         conn,
                         "SELECT key, value, revision FROM objects \
-                         WHERE key >= ?1 AND ns = ?2 AND key > ?3 ORDER BY key ASC",
+                         WHERE key >= ?1 AND (ns = ?2 OR (?2 = '' AND ns IS NULL)) AND key > ?3 \
+                         ORDER BY key ASC",
                         &[&prefix, value as &dyn rusqlite::ToSql, &ck],
                     )?
                 }
@@ -1610,14 +1618,16 @@ fn list_sync(conn: &Connection, prefix: &str, opts: &ListOptions) -> Result<List
                 query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 ORDER BY key ASC",
+                     WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                     ORDER BY key ASC",
                     &[&prefix, &upper, value as &dyn rusqlite::ToSql],
                 )?
             } else {
                 query_all(
                     conn,
                     "SELECT key, value, revision FROM objects \
-                     WHERE key >= ?1 AND key < ?2 AND ns = ?3 AND key > ?4 ORDER BY key ASC",
+                     WHERE key >= ?1 AND key < ?2 AND (ns = ?3 OR (?3 = '' AND ns IS NULL)) \
+                     AND key > ?4 ORDER BY key ASC",
                     &[&prefix, &upper, value as &dyn rusqlite::ToSql, &ck],
                 )?
             };
@@ -3292,6 +3302,85 @@ mod tests {
             "spec.nodeName=node-1 must match only the pod scheduled to node-1, not the \
              unscheduled pod; the empty-value OR clause must not widen the common (real value) \
              match path"
+        );
+    }
+
+    /// The metadata.namespace SQL fast-path must match cluster-scoped objects (no `ns` column,
+    /// since they have no `metadata.namespace`) against an empty-value selector, and must still
+    /// match only the exact namespace for a real-value selector.
+    ///
+    /// Why it matters: `metadata.namespace` is a generic selectable field on every object type
+    /// per k8s field-selector semantics, including cluster-scoped types (Namespace, Node,
+    /// PersistentVolume, ...) whose objects always have an absent/empty namespace. `ns = ?`
+    /// is SQL-NULL (never true) for a NULL `ns` column, so a naive fast-path silently returns
+    /// zero results for `fieldSelector=metadata.namespace=` against cluster-scoped resources —
+    /// e.g. `kubectl get namespaces --field-selector metadata.namespace=`, which the generic
+    /// `list_resource`/`list_namespaces` handlers pass straight through with no scope
+    /// restriction, would wrongly return an empty list instead of every namespace.
+    #[tokio::test]
+    async fn namespace_fast_path_empty_selector_matches_cluster_scoped_objects() {
+        let store = SqliteStore::new(":memory:").expect("in-memory store");
+
+        store
+            .put(
+                "/registry/namespaces/cluster-scoped-ns",
+                Bytes::from(r#"{"metadata":{"name":"cluster-scoped-ns"}}"#),
+                None,
+            )
+            .await
+            .expect("put cluster-scoped object (no metadata.namespace)");
+        store
+            .put(
+                "/registry/namespaces/namespaced-decoy",
+                Bytes::from(r#"{"metadata":{"name":"namespaced-decoy","namespace":"prod"}}"#),
+                None,
+            )
+            .await
+            .expect("put namespaced decoy object");
+
+        let cluster_scoped = store
+            .list(
+                "/registry/namespaces/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "metadata.namespace".to_string(),
+                        value: String::new(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with empty-value namespace selector");
+        assert_eq!(
+            cluster_scoped.items.len(),
+            1,
+            "metadata.namespace= must match the object with no namespace key; if the SQL \
+             fast-path compares a NULL ns column to '' with plain equality it matches nothing, \
+             so a cluster-scoped LIST filtered by an empty namespace selector wrongly returns \
+             zero objects instead of the object with no namespace"
+        );
+
+        let namespaced = store
+            .list(
+                "/registry/namespaces/",
+                ListOptions {
+                    field_selector: Some(FieldSelector {
+                        field: "metadata.namespace".to_string(),
+                        value: "prod".to_string(),
+                        negated: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("list with real-value namespace selector");
+        assert_eq!(
+            namespaced.items.len(),
+            1,
+            "metadata.namespace=prod must match only the object in namespace prod, not the \
+             cluster-scoped object; the empty-value OR clause must not widen the common \
+             (real value) match path"
         );
     }
 
