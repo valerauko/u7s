@@ -31,10 +31,10 @@ use u7s_kubeconfig::{build_tls_connector, parse_kubeconfig};
 use crate::{
     bind_pod, delete_pod, disruption_target_patch, emit_scheduling_event,
     failed_scheduling_status_patch, fetch_bound_pv_node_affinities, fetch_csi_volume_counts,
-    fetch_node, fetch_read_write_once_pod_pvc_names, find_preemption_plan, http_get,
-    is_bind_already_assigned, needs_scheduling, nominated_node_name_patch, patch_pod_status,
-    pick_node, pods_needing_resync, preemption_reservation_still_fits,
-    scheduling_gate_status_patch, scheduling_gate_status_reset,
+    fetch_node, fetch_read_write_once_pod_pvc_names, fetch_unbound_csi_pvc_drivers,
+    find_preemption_plan, http_get, is_bind_already_assigned, needs_scheduling,
+    nominated_node_name_patch, patch_pod_status, pick_node, pods_needing_resync,
+    preemption_reservation_still_fits, scheduling_gate_status_patch, scheduling_gate_status_reset,
     should_retry_after_preemption_plan_error, should_retry_without_preempting, should_schedule,
     stamp_selected_node_for_pvcs, stream_watch_events, BindError, NodeTally, PendingPod, PodList,
 };
@@ -795,6 +795,33 @@ fn handle_pod_event(
                 Err(e) => {
                     error!(
                         "could not resolve ReadWriteOncePod PVCs while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
+                    );
+                    in_flight_clone
+                        .lock()
+                        .expect("in_flight lock poisoned")
+                        .remove(&key);
+                    return;
+                }
+            }
+            // Same reasoning again, for the CSI topology Filter: without
+            // this, a pod's own unbound CSI-backed PVCs never get their
+            // driver resolved, so `csi_topology_fit` always sees an empty
+            // want-set and the scheduler can bind the pod to a node the
+            // driver never registered — the AnyVolumeDataSource populate-pod
+            // hang this predicate exists to close (see
+            // `fetch_unbound_csi_pvc_drivers`'s doc comment).
+            match fetch_unbound_csi_pvc_drivers(
+                &connector_clone,
+                &server_clone,
+                &namespace,
+                &pending.pvc_names,
+            )
+            .await
+            {
+                Ok(drivers) => pending.unbound_csi_pvc_drivers = drivers,
+                Err(e) => {
+                    error!(
+                        "could not resolve unbound CSI PVC drivers while scheduling {namespace}/{pod_name}: {e} — retrying on next watch tick"
                     );
                     in_flight_clone
                         .lock()
