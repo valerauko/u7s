@@ -3,8 +3,13 @@
 # in-VM processes, and deletes the VM so the next run starts clean.
 #
 # Usage:
-#   scripts/conformance/reset.sh [--vm <name>] [--workdir <path>] [--port <N>]
+#   scripts/conformance/reset.sh [--vm <name>] [--workdir <path>]
 #                                 [--extra-node <vm>] [--host-only]
+#                                 [--port <N>] [--konnectivity-server-port <N>]
+#
+# --port / --konnectivity-server-port are accepted (run-all.sh passes them
+#   unconditionally) but are documented no-ops: host processes are killed by
+#   cmdline pattern, never by port number -- see host_kill_pattern_for below.
 #
 # After this script:
 #   - ./temp/u7s/ is gone (DB, certs, kubeconfig, PID files all wiped)
@@ -32,103 +37,29 @@
 #   scripts/conformance/run-all.sh
 set -euo pipefail
 
-WORKDIR="$PWD/temp/u7s"
-VM_NAME="${U7S_VM_NAME:-lima-node}"
-EXTRA_NODE=""
-HOST_ONLY=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --workdir) WORKDIR="$2"; shift 2 ;;
-    --vm) VM_NAME="$2"; shift 2 ;;
-    --extra-node) EXTRA_NODE="$2"; shift 2 ;;
-    --host-only) HOST_ONLY=1; shift ;;
-    # --port and --konnectivity-server-port are accepted for compatibility
-    # with run-all.sh's unconditional pass-through, but otherwise unused:
-    # host processes are killed by cmdline pattern (binary name + --workdir
-    # path) below, never by port number, so no port math is needed here.
-    --port) shift 2 ;;
-    --konnectivity-server-port) shift 2 ;;
-    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+# Pure: the pkill -f pattern that scopes a host-process kill to THIS
+# worktree's own u7s component, by full cmdline (binary name + this
+# workdir's path) — never by "whatever holds this port". A blanket
+# 'lsof -ti tcp:$PORT | kill' also matches Lima's shared 'limactl usernet'
+# network daemon: it proxies the guest VM's host.lima.internal:$PORT
+# connections (kubelet/KCM/kube-proxy talking to the apiserver, or the
+# konnectivity-agent talking to the agent port) through this exact host
+# port, so it legitimately shows up as a port holder. SIGTERMing it as
+# blanket-kill collateral breaks guest->host connectivity for every OTHER
+# worker VM sharing this Lima network, not just this worktree's own VM
+# (confirmed live: 'ip neigh' gateway goes INCOMPLETE). A cmdline-pattern
+# match can never hit it: 'limactl usernet ...' contains neither a u7s
+# binary name nor this workdir path. Mirrors scripts/worktree-hygiene.sh's
+# kill_pattern_for() — keep them in sync if either script's launch-argv
+# shape changes.
+host_kill_pattern_for() {
+  local component="$1" workdir="$2"
+  case "$component" in
+    apiserver) printf 'u7s-apiserver.*%s/kubeconfig' "$workdir" ;;
+    scheduler) printf 'u7s-scheduler.*%s/kubeconfig' "$workdir" ;;
+    konnectivity-server) printf 'konnectivity-server.*%s' "$workdir" ;;
   esac
-done
-
-# Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
-# first --reset targets a WORKDIR that isn't there yet) so the pkill match
-# below is worktree-unique instead of matching another worktree that was
-# invoked with the same relative --workdir.
-case "$WORKDIR" in
-  /*) ;;
-  *) WORKDIR="$PWD/$WORKDIR" ;;
-esac
-
-echo "=== [reset] Conformance teardown ==="
-
-# ── 1. Kill host processes ────────────────────────────────────────────────────
-
-echo "[reset] Stopping host processes ..."
-
-for name in apiserver scheduler; do
-  pidfile="$WORKDIR/${name}.pid"
-  if [ -f "$pidfile" ]; then
-    pid="$(cat "$pidfile")"
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "[reset]   killing u7s-${name} (PID $pid)"
-      kill "$pid" 2>/dev/null || true
-    else
-      echo "[reset]   u7s-${name} PID $pid already gone"
-    fi
-  fi
-done
-
-# Fallback: kill this worktree's own u7s-apiserver / u7s-scheduler, scoped by
-# full cmdline (binary name + this workdir's path) — NOT by "whatever holds
-# the apiserver's port". A blanket 'lsof -ti tcp:$PORT | kill' also matches
-# Lima's shared 'limactl usernet' network daemon: it proxies the guest VM's
-# host.lima.internal:$PORT connections (kubelet/KCM/kube-proxy talking to the
-# apiserver) through this exact host port, so it legitimately shows up as a
-# port holder. SIGTERMing it as blanket-kill collateral breaks guest->host
-# connectivity for every OTHER worker VM sharing this Lima network, not just
-# this worktree's own VM (confirmed live: 'ip neigh' gateway goes
-# INCOMPLETE). pkill -f matches only OUR processes' argv, never the shared
-# daemon's ('limactl usernet ...' contains neither binary name nor workdir).
-pkill -f "u7s-apiserver.*${WORKDIR}/kubeconfig" 2>/dev/null || true
-pkill -f "u7s-scheduler.*${WORKDIR}/kubeconfig" 2>/dev/null || true
-
-# The run-metrics sampler (started by run-all.sh alongside the stack, see
-# sample-run-metrics.sh) is a peer of apiserver/scheduler for teardown
-# purposes too — without this, a --stack-only session's sampler survives
-# `rm -rf "$WORKDIR"` below as an orphan still appending to its now-unlinked
-# CSVs. Its own `stop` does the SIGTERM+poll reap; harmless if none is running.
-bash scripts/conformance/sample-run-metrics.sh stop --workdir "$WORKDIR" >/dev/null 2>&1 || true
-
-# konnectivity-server is started via `disown` (scripts/u7s-start.sh), so it survives
-# even after its origin worktree is deleted, still bound to this port slot and still
-# serving its old CA-signed cert. If left running, the next run's fresh CA/agent
-# reject that stale cert with "certificate signed by unknown authority ... ECDSA
-# verification failure" — kill it before regenerating certs. Scoped by cmdline, not
-# by port, for the same reason as the apiserver fallback above: a guest VM's
-# konnectivity-agent talking to host.lima.internal:<agent-port> makes the shared
-# Lima network daemon a legitimate holder of that port too.
-pkill -f "konnectivity-server.*${WORKDIR}" 2>/dev/null || true
-
-if [ "$HOST_ONLY" -eq 1 ]; then
-  echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
-  echo "[reset] Done (host-only)."
-  exit 0
-fi
-
-# ── 2. Wipe host state ────────────────────────────────────────────────────────
-
-if [ -d "$WORKDIR" ]; then
-  echo "[reset] Removing $WORKDIR ..."
-  rm -rf "$WORKDIR"
-else
-  echo "[reset] $WORKDIR already absent"
-fi
-
-# ── 3. Kill in-VM processes + delete the VM (best-effort) ───────────────────
-# Applied to the primary VM and, if named, the --extra-node VM — see the
-# --extra-node usage note above for why the extra node must not be skipped.
+}
 
 # SIGKILL is not synchronous: 'kill -0 $pid' checked immediately after
 # 'kill -9 $pid' can still report the PID alive for a brief moment before the
@@ -227,9 +158,106 @@ teardown_vm() {
   fi
 }
 
-teardown_vm "$VM_NAME"
-if [ -n "$EXTRA_NODE" ]; then
-  teardown_vm "$EXTRA_NODE"
-fi
+main() {
+  local WORKDIR="$PWD/temp/u7s"
+  local VM_NAME="${U7S_VM_NAME:-lima-node}"
+  local EXTRA_NODE=""
+  local HOST_ONLY=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workdir) WORKDIR="$2"; shift 2 ;;
+      --vm) VM_NAME="$2"; shift 2 ;;
+      --extra-node) EXTRA_NODE="$2"; shift 2 ;;
+      --host-only) HOST_ONLY=1; shift ;;
+      # --port and --konnectivity-server-port: see the usage-banner note above.
+      --port) shift 2 ;;
+      --konnectivity-server-port) shift 2 ;;
+      *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+  done
 
-echo "[reset] Done. Run scripts/conformance/run-all.sh for a fresh conformance run."
+  # Resolve to absolute without requiring WORKDIR to exist (a fresh worktree's
+  # first --reset targets a WORKDIR that isn't there yet) so the pkill match
+  # below is worktree-unique instead of matching another worktree that was
+  # invoked with the same relative --workdir.
+  case "$WORKDIR" in
+    /*) ;;
+    *) WORKDIR="$PWD/$WORKDIR" ;;
+  esac
+
+  echo "=== [reset] Conformance teardown ==="
+
+  # ── 1. Kill host processes ──────────────────────────────────────────────
+
+  echo "[reset] Stopping host processes ..."
+
+  local name pidfile pid
+  for name in apiserver scheduler; do
+    pidfile="$WORKDIR/${name}.pid"
+    if [ -f "$pidfile" ]; then
+      pid="$(cat "$pidfile")"
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "[reset]   killing u7s-${name} (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+      else
+        echo "[reset]   u7s-${name} PID $pid already gone"
+      fi
+    fi
+  done
+
+  # Fallback, scoped by cmdline (see host_kill_pattern_for above for why).
+  pkill -f "$(host_kill_pattern_for apiserver "$WORKDIR")" 2>/dev/null || true
+  pkill -f "$(host_kill_pattern_for scheduler "$WORKDIR")" 2>/dev/null || true
+
+  # The run-metrics sampler (started by run-all.sh alongside the stack, see
+  # sample-run-metrics.sh) is a peer of apiserver/scheduler for teardown
+  # purposes too — without this, a --stack-only session's sampler survives
+  # `rm -rf "$WORKDIR"` below as an orphan still appending to its now-unlinked
+  # CSVs. Its own `stop` does the SIGTERM+poll reap; harmless if none is running.
+  bash scripts/conformance/sample-run-metrics.sh stop --workdir "$WORKDIR" >/dev/null 2>&1 || true
+
+  # konnectivity-server is started via `disown` (scripts/u7s-start.sh), so it survives
+  # even after its origin worktree is deleted, still bound to this port slot and still
+  # serving its old CA-signed cert. If left running, the next run's fresh CA/agent
+  # reject that stale cert with "certificate signed by unknown authority ... ECDSA
+  # verification failure" — kill it before regenerating certs, scoped by cmdline.
+  pkill -f "$(host_kill_pattern_for konnectivity-server "$WORKDIR")" 2>/dev/null || true
+
+  if [ "$HOST_ONLY" -eq 1 ]; then
+    echo "[reset] --host-only: skipping \$WORKDIR wipe and VM teardown"
+    echo "[reset] Done (host-only)."
+    exit 0
+  fi
+
+  # ── 2. Wipe host state ───────────────────────────────────────────────────
+
+  if [ -d "$WORKDIR" ]; then
+    echo "[reset] Removing $WORKDIR ..."
+    rm -rf "$WORKDIR"
+  else
+    echo "[reset] $WORKDIR already absent"
+  fi
+
+  # ── 3. Kill in-VM processes + delete the VM (best-effort) ────────────────
+  # Applied to the primary VM and, if named, the --extra-node VM — see the
+  # --extra-node usage note above for why the extra node must not be skipped.
+
+  teardown_vm "$VM_NAME"
+  if [ -n "$EXTRA_NODE" ]; then
+    teardown_vm "$EXTRA_NODE"
+  fi
+
+  echo "[reset] Done. Run scripts/conformance/run-all.sh for a fresh conformance run."
+}
+
+# `<script> __call <fn> [args...]` invokes a single pure function (e.g.
+# host_kill_pattern_for) from a test, without running the actual teardown --
+# same convention as scripts/worktree-hygiene.sh.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
+  if [ "${1:-}" = "__call" ]; then
+    shift
+    "$@"
+  else
+    main "$@"
+  fi
+fi
