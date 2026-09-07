@@ -248,8 +248,21 @@ pub(crate) async fn list_resource<S: Store>(
     // materializing a Vec<Value> of every item below. PartialObjectMetadata/Table build
     // their own projected shape from the full collection, and protobuf negotiation needs
     // a real parsed Value tree to find its per-kind encoder, so both keep the
-    // materializing path.
-    if !pom && !table && !crate::content_type::wants_protobuf(accept) {
+    // materializing path — but only for kinds that actually HAVE a registered encoder.
+    // Real clients (kubelet/client-go) send a combined `Accept: .../protobuf, .../json`
+    // on every request, so gating on `wants_protobuf` alone routed every kind outside the
+    // handful in `encoders()` (everything else falls back to JSON regardless) into the
+    // materializing path, defeating the streaming path's memory win for almost all real
+    // LIST traffic.
+    let list_api_version = if group.is_empty() {
+        version.clone()
+    } else {
+        format!("{}/{}", group, version)
+    };
+    let list_kind = format!("{}List", meta.kind);
+    let wants_real_protobuf = crate::content_type::wants_protobuf(accept)
+        && crate::content_type::has_encoder(&list_api_version, &list_kind);
+    if !pom && !table && !wants_real_protobuf {
         let body = stream_list_json(
             &meta.kind,
             &group,
@@ -27559,12 +27572,15 @@ mod tests {
 
     // -- streaming LIST path must match the pre-optimization materializing path --
     //
-    // list_resource takes the new streaming path (stream_list_json) whenever the request
-    // isn't PartialObjectMetadata/Table and doesn't negotiate protobuf; it falls back to the
-    // old materialize-then-filter-then-envelope path otherwise. Requesting a kind with no
-    // registered protobuf encoder (CSINode) under a protobuf Accept header exercises that old
-    // path end to end (negotiated_response still falls back to JSON) without touching
-    // content_type.rs, so these tests can compare the two paths' actual wire bytes.
+    // list_resource takes the streaming path (stream_list_json) whenever the request isn't
+    // PartialObjectMetadata/Table and won't actually be protobuf-encoded; it falls back to
+    // the old materialize-then-filter-then-envelope path otherwise. CSINode has no
+    // registered protobuf encoder, so a protobuf Accept header for it falls back to JSON
+    // either way and now takes the SAME streaming path as a plain JSON Accept — these tests
+    // pin that the two Accept headers still produce byte-identical output for a non-encoder
+    // kind. `list_resource_with_protobuf_accept_and_registered_encoder_returns_real_protobuf`
+    // below covers the complementary case: a kind WITH a registered encoder must still take
+    // the materializing path and get real protobuf bytes.
 
     async fn seed_csinodes(
         names_and_labels: &[(&str, &str)],
@@ -27645,9 +27661,9 @@ mod tests {
     }
 
     /// A malformed empty LIST breaks every client's initial informer sync; this pins that
-    /// the streaming path (no items ever alive as parsed Values) and the materializing path
-    /// (falls back to protobuf-Accept's JSON path, since CSINode has no proto encoder) emit
-    /// byte-identical wire bytes for the zero-item case.
+    /// a plain JSON Accept and a protobuf Accept (CSINode has no registered encoder, so it
+    /// falls back to JSON and also takes the streaming path) emit byte-identical wire bytes
+    /// for the zero-item case.
     #[tokio::test]
     async fn streaming_list_matches_materializing_path_for_empty_list() {
         let store = seed_csinodes(&[]).await;
@@ -27674,10 +27690,10 @@ mod tests {
     }
 
     /// The common case (many items, a label selector dropping some of them) is what the
-    /// streaming path targets for peak-memory reduction; this pins that per-item filtering
-    /// applied inline (streaming) drops exactly the same items, in the same order, as
-    /// filtering the fully materialized Vec (old path) — a single dropped or reordered item
-    /// corrupts every client's view of the collection.
+    /// streaming path targets for peak-memory reduction; this pins that the Accept header
+    /// (plain JSON vs. protobuf-falling-back-to-JSON for a non-encoder kind) does not change
+    /// which items survive label filtering or their order — a single dropped or reordered
+    /// item corrupts every client's view of the collection.
     #[tokio::test]
     async fn streaming_list_matches_materializing_path_for_label_selected_multi_item_list() {
         let store = seed_csinodes(&[
@@ -27704,8 +27720,8 @@ mod tests {
     /// Chunked LIST pagination (`limit` + `continue`) is the path most likely to regress from
     /// streaming, since the envelope's `continue`/`remainingItemCount` fields are computed
     /// from the store response before any item is parsed. This pins the whole envelope
-    /// (kind/apiVersion/metadata/items) as identical between paths, and — because the
-    /// `continue` token embeds a wall-clock timestamp that can legitimately differ by a
+    /// (kind/apiVersion/metadata/items) as identical between Accept headers, and — because
+    /// the `continue` token embeds a wall-clock timestamp that can legitimately differ by a
     /// second between two sequential calls — separately decodes both tokens' payloads and
     /// asserts their store key and pinned resourceVersion match, so a real drift in the
     /// pagination cursor itself (not just its timestamp) is still caught.
@@ -27771,5 +27787,96 @@ mod tests {
             payload["k"].as_str().unwrap().to_string(),
             payload["rv"].as_u64().unwrap(),
         )
+    }
+
+    /// Every one of the three streaming-vs-materializing tests above uses CSINode, which has
+    /// no registered protobuf encoder — so none of them ever exercises the branch this
+    /// routing guard exists to preserve: a kind WITH a registered encoder must still take the
+    /// materializing path and get real protobuf bytes back, not be swept into the JSON
+    /// streaming path by a guard that ignores encoder registration. Node/NodeList has a
+    /// registered encoder (`encode_nodelist_proto_gen`); if the guard's `has_encoder` check
+    /// were dropped, inverted, or looked up the wrong (apiVersion, kind) pair, this LIST would
+    /// wrongly take `stream_list_json` and the assertions below (protobuf Content-Type, magic
+    /// prefix, decodable `NodeList` bytes) would fail.
+    #[tokio::test]
+    async fn list_resource_with_protobuf_accept_and_registered_encoder_returns_real_protobuf() {
+        use prost::Message;
+
+        let store =
+            std::sync::Arc::new(u7s_store::SqliteStore::new(":memory:").expect("in-memory store"));
+        let node = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": { "name": "worker-1" },
+        });
+        store
+            .put(
+                "/registry/nodes/worker-1",
+                bytes::Bytes::from(serde_json::to_vec(&node).unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let state = crate::handlers::test_support::make_state_with_store(store);
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCEPT,
+            axum::http::HeaderValue::from_static(
+                "application/vnd.kubernetes.protobuf, application/json",
+            ),
+        );
+
+        let resp = list_resource(
+            State(state),
+            Path(("".into(), "v1".into(), "nodes".into())),
+            Query(csinode_query(None, None, None)),
+            headers,
+            Extension(crate::auth::UserInfo {
+                username: "admin".into(),
+                uid: String::new(),
+                groups: vec!["system:masters".into()],
+                extra: Default::default(),
+            }),
+        )
+        .await
+        .expect("list_resource must not error")
+        .into_response();
+
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/vnd.kubernetes.protobuf",
+            "NodeList has a registered encoder — the routing guard must still send it \
+             through the materializing path, or a real client-go typed NodeList decoder is \
+             silently handed JSON it cannot parse"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            body.starts_with(&[0x6b, 0x38, 0x73, 0x00]),
+            "body must start with the k8s protobuf magic prefix"
+        );
+        let envelope = crate::proto::decode_k8s_proto_envelope(&body)
+            .expect("response body must decode as a k8s protobuf envelope");
+        assert_eq!(envelope.kind, "NodeList");
+        let decoded =
+            crate::apps_gen::k8s::io::api::core::v1::NodeList::decode(envelope.raw.as_slice())
+                .expect("envelope raw field must decode as a real NodeList protobuf message");
+        assert_eq!(
+            decoded.items.len(),
+            1,
+            "the materializing path must not drop items when protobuf-encoding a LIST"
+        );
+        assert_eq!(
+            decoded.items[0]
+                .metadata
+                .as_ref()
+                .and_then(|m| m.name.as_deref()),
+            Some("worker-1"),
+            "the decoded NodeList item must be the real seeded Node, not a placeholder"
+        );
     }
 }

@@ -113,6 +113,20 @@ pub fn wants_protobuf(accept: &str) -> bool {
     accept.contains("application/vnd.kubernetes.protobuf")
 }
 
+/// Whether `(api_version, kind)` has a registered protobuf encoder in [`encoders()`].
+///
+/// Callers that build a response body themselves (rather than going through
+/// [`negotiated_response`]) — e.g. a LIST handler deciding whether it's safe to stream
+/// straight to JSON bytes without ever materializing a parsed `Value` tree — need this
+/// answer BEFORE building the body. Real clients (kubelet/client-go) send a combined
+/// `Accept: application/vnd.kubernetes.protobuf, application/json`, so `wants_protobuf`
+/// alone can't tell a kind that will actually get protobuf apart from one that's about to
+/// fall back to JSON anyway; only a kind present in `encoders()` needs the non-streaming
+/// path.
+pub fn has_encoder(api_version: &str, kind: &str) -> bool {
+    encoders().contains_key(&(api_version, kind))
+}
+
 /// Build the response body for an already-assembled JSON object, honoring protobuf content
 /// negotiation for the hot-path kinds registered in `encoders()`.
 ///
