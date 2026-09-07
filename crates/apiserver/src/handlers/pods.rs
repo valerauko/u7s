@@ -5252,6 +5252,46 @@ pub(crate) fn apply_pod_spec_defaults(pod: &mut serde_json::Value) {
         }
     }
 
+    // resources.requests: default each resource key from resources.limits when that key
+    // has a limit but no request, mirroring upstream's SetDefaults_Pod (per-key limits->
+    // requests merge for containers and initContainers; ephemeralContainers are excluded
+    // there too — pkg/apis/core/v1/defaults.go:164-192 @ release-1.36.0). This is
+    // unconditional, unlike limit_range::inject_defaults's requests<-limits inheritance,
+    // which only fires inside a LimitRange's per-item loop and is a no-op when the
+    // namespace has no LimitRange at all. Real kube-apiserver runs this at pod-create
+    // admission and PERSISTS the defaulted pod, so the scheduler's fit check, quota
+    // accounting (quota::pod_resource_milli), and `kubectl get pod -o json` all observe
+    // the same materialized requests — without it, a pod declaring only `limits` (no
+    // `requests`) is scheduled as if it requested nothing, undercounting its footprint
+    // against node capacity and RuntimeClass overhead (conformance
+    // "[sig-scheduling] SchedulerPredicates ... verify pod overhead is accounted for").
+    // Merge is per resource key, not all-or-nothing: a container with `requests.cpu` set
+    // but no `requests.memory`, and `limits.memory` set, still gets `requests.memory`
+    // defaulted from the limit.
+    for containers_key in &["containers", "initContainers"] {
+        if let Some(containers) = pod["spec"][containers_key].as_array_mut() {
+            for container in containers {
+                let limit_keys: Vec<String> = container["resources"]["limits"]
+                    .as_object()
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                if limit_keys.is_empty() {
+                    continue;
+                }
+                if !container["resources"]["requests"].is_object() {
+                    container["resources"]["requests"] =
+                        serde_json::Value::Object(Default::default());
+                }
+                for key in &limit_keys {
+                    if container["resources"]["requests"][key.as_str()].is_null() {
+                        let limit_val = container["resources"]["limits"][key.as_str()].clone();
+                        container["resources"]["requests"][key.as_str()] = limit_val;
+                    }
+                }
+            }
+        }
+    }
+
     // Default fieldRef.apiVersion to "v1" and port protocol to "TCP" for all containers
     // (including initContainers). Real kube-apiserver stamps both fields before storing.
     // Absent fieldRef.apiVersion causes kubelet "unsupported pod version: <empty>".
@@ -6928,6 +6968,94 @@ mod create_defaults_tests {
         assert_eq!(
             pod["spec"]["serviceAccountName"], "custom-sa",
             "an explicit serviceAccountName must not be overwritten by the default"
+        );
+    }
+
+    /// A container's `resources.requests` must default from `resources.limits` per
+    /// resource key, unconditionally (no LimitRange required).
+    ///
+    /// Mirrors upstream SetDefaults_Pod (pkg/apis/core/v1/defaults.go:164-192): a
+    /// container declaring only `limits.memory` (no `requests.memory`) is otherwise
+    /// scheduled as if it requested zero memory, undercounting its true footprint
+    /// against node capacity, ResourceQuota, and RuntimeClass overhead — this is the
+    /// exact defect behind conformance "[sig-scheduling] SchedulerPredicates ...
+    /// verify pod overhead is accounted for". The merge is per-key, not
+    /// all-or-nothing: `requests.cpu` set explicitly must survive untouched while
+    /// `requests.memory` gets backfilled from `limits.memory`.
+    #[test]
+    fn container_requests_default_from_limits_per_key() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "resources": {
+                        "requests": {"cpu": "100m"},
+                        "limits": {"cpu": "500m", "memory": "256Mi"}
+                    }
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        let resources = &pod["spec"]["containers"][0]["resources"];
+        assert_eq!(
+            resources["requests"]["memory"], "256Mi",
+            "requests.memory must be backfilled from limits.memory when the key is \
+             missing from requests, matching upstream's per-key limits->requests default"
+        );
+        assert_eq!(
+            resources["requests"]["cpu"], "100m",
+            "an explicit requests.cpu must survive untouched — defaulting must not \
+             overwrite a key the caller already set, even though limits.cpu differs"
+        );
+    }
+
+    /// This defaulting must also apply to init containers, matching upstream's
+    /// separate (but identical) loop over `Spec.InitContainers` in SetDefaults_Pod —
+    /// an init container with only `limits` set is scheduled as part of the same
+    /// pod-fit check as regular containers and must not be silently under-requested.
+    #[test]
+    fn init_container_requests_default_from_limits_per_key() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "initContainers": [{
+                    "name": "init",
+                    "image": "busybox",
+                    "resources": {"limits": {"memory": "128Mi"}}
+                }],
+                "containers": [{"name": "app", "image": "busybox"}]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod["spec"]["initContainers"][0]["resources"]["requests"]["memory"], "128Mi",
+            "initContainers must get the same per-key requests<-limits default as \
+             regular containers"
+        );
+    }
+
+    /// Ephemeral containers must NOT receive this default — upstream's SetDefaults_Pod
+    /// only loops over `Spec.Containers` and `Spec.InitContainers`, deliberately
+    /// excluding `Spec.EphemeralContainers`. Defaulting them here would diverge from
+    /// what a real apiserver stores and could mislead debug-only ephemeral containers
+    /// into carrying resource requests they were never meant to have.
+    #[test]
+    fn ephemeral_container_requests_not_defaulted_from_limits() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}],
+                "ephemeralContainers": [{
+                    "name": "debug",
+                    "image": "busybox",
+                    "resources": {"limits": {"memory": "64Mi"}}
+                }]
+            }
+        });
+        apply_pod_create_defaults(&mut pod);
+        assert!(
+            pod["spec"]["ephemeralContainers"][0]["resources"]["requests"].is_null(),
+            "ephemeralContainers must not get requests defaulted from limits — upstream \
+             excludes them from this pass"
         );
     }
 

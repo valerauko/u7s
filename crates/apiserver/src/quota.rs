@@ -1731,6 +1731,41 @@ mod tests {
         );
     }
 
+    // -- pod_resource_milli observes apiserver-side defaulting --
+
+    /// `pod_resource_milli` must observe requests that `apply_pod_create_defaults`
+    /// backfilled from limits, not just requests the client explicitly sent.
+    ///
+    /// This is the integration point for the create-defaulting fix: create_pod runs
+    /// `apply_pod_create_defaults` (handlers::pods) BEFORE `check_resource_quota`, so a
+    /// pod declaring only `limits.memory` (no `requests.memory`) must already carry the
+    /// backfilled `requests.memory` by the time quota reads it here — otherwise
+    /// ResourceQuota silently undercounts the pod's true memory footprint, the same bug
+    /// class the scheduler had for pod-overhead accounting. If this regresses (either
+    /// the defaulting is skipped, or quota admission moves ahead of it), this test
+    /// reads a pod with no `requests.memory` and asserts 0, which fails against the
+    /// non-zero expectation below.
+    #[test]
+    fn pod_resource_milli_reads_apiserver_defaulted_requests() {
+        let mut pod = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "busybox",
+                    "resources": {"limits": {"memory": "256Mi"}}
+                }]
+            }
+        });
+        crate::handlers::pods::apply_pod_create_defaults(&mut pod);
+        assert_eq!(
+            pod_resource_milli(Some(&pod), "requests", "memory"),
+            256 * 1024 * 1024 * 1000,
+            "quota must count the requests.memory that create-defaulting backfilled from \
+             limits.memory — reading only client-supplied requests undercounts a \
+             limits-only pod's footprint against namespace ResourceQuota"
+        );
+    }
+
     // -- check_resource_quota --
 
     /// No ResourceQuota in namespace → creation must be allowed.
