@@ -238,6 +238,16 @@ struct ContainerSpec {
 struct ContainerResources {
     #[serde(default)]
     requests: std::collections::HashMap<String, String>,
+    /// Read by `sum_container_requests` as the effective request whenever
+    /// `requests` is entirely absent — `v1.ResourceRequirements.Requests`'s own
+    /// field doc says "If Requests is omitted for a container, it defaults to
+    /// Limits if that is explicitly specified", and every accounting consumer
+    /// (scheduler, kubectl, quota) implements that fallback itself rather than
+    /// relying on the apiserver to store a mutated copy. Without this, a
+    /// Limits-only container looks like it needs zero resources and can
+    /// over-subscribe a node.
+    #[serde(default)]
+    limits: std::collections::HashMap<String, String>,
 }
 
 /// One `container.ports[]` entry — only the fields the NodePorts predicate
@@ -1283,10 +1293,23 @@ fn accumulate_request(total: &mut ResourceRequests, name: &str, quantity: &str) 
 /// accounted for — this MVP sums the steady-state (regular) containers only,
 /// matching what the conformance suite's saturate-then-overflow tests
 /// actually create.
+///
+/// Per container, `requests` is used if non-empty; otherwise `limits` is used
+/// in its place — mirroring upstream's `v1.ResourceRequirements.Requests` field
+/// doc ("If Requests is omitted... it defaults to Limits") and its shared
+/// `PodRequests` accounting helper. A Limits-only container is common (e.g. the
+/// PodOverhead conformance test's "additional pod") and without this fallback
+/// it looks like it needs zero resources, letting the scheduler over-subscribe
+/// the node.
 fn sum_container_requests(containers: &[ContainerSpec]) -> ResourceRequests {
     let mut total = ResourceRequests::default();
     for c in containers {
-        for (name, quantity) in &c.resources.requests {
+        let effective = if c.resources.requests.is_empty() {
+            &c.resources.limits
+        } else {
+            &c.resources.requests
+        };
+        for (name, quantity) in effective {
             accumulate_request(&mut total, name, quantity);
         }
     }
@@ -10209,6 +10232,46 @@ mod tests {
             "a pod whose container requests alone fit, but whose RuntimeClass \
              overhead pushes it past allocatable cpu, must be rejected — \
              otherwise the scheduler over-subscribes the node"
+        );
+    }
+
+    /// The PodOverhead conformance suite's exact shape: a container sets only
+    /// `resources.limits` (no `requests`), and the pod's RuntimeClass adds
+    /// overhead on top. Upstream's `v1.ResourceRequirements.Requests` field doc
+    /// says an omitted `requests` defaults to `limits`, and the shared
+    /// `PodRequests` helper every consumer relies on implements exactly that
+    /// fallback. Before this fix, `sum_container_requests` only ever read
+    /// `requests`, so a limits-only container looked like it needed nothing —
+    /// the additional pod (limits: 200 + overhead: 250 = 450) would be bound to
+    /// a node with only 300 of the fake resource remaining, instead of staying
+    /// Pending like `verify pod overhead is accounted for` asserts.
+    #[test]
+    fn sum_container_requests_falls_back_to_limits_when_requests_absent() {
+        let allocatable = node_allocatable_extended("example.com/beardsecond", "1000");
+        let used = extended_request("example.com/beardsecond", 700_000); // filler pod
+        let event = json!({
+            "type": "ADDED",
+            "object": {
+                "metadata": { "name": "additional-pod", "namespace": "default" },
+                "spec": {
+                    "containers": [
+                        { "resources": { "limits": { "example.com/beardsecond": "200" } } }
+                    ],
+                    "overhead": { "example.com/beardsecond": "250" }
+                }
+            }
+        });
+        let pending = needs_scheduling(&event).expect("unscheduled pod must be schedulable");
+        assert_eq!(
+            pending.requests.extended["example.com/beardsecond"], 450_000,
+            "limits (200) must be used as the effective request when requests is \
+             absent, plus overhead (250) — 450 total"
+        );
+        assert!(
+            !resource_fits(&allocatable, &used, &pending.requests),
+            "a limits-only pod whose effective request plus overhead exceeds the \
+             node's remaining capacity must be rejected, not silently scheduled \
+             as if it requested nothing"
         );
     }
 
